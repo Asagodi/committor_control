@@ -67,7 +67,6 @@ def sliding_window_fp(X, window_size=50):
     return np.array(A_list), np.array(b_list)
 
 
-
 def ema_update_and_residuals(mean_prev, x_prev, x_new, eta):
     """
     Exponential Moving Average (EMA) update with residuals.
@@ -235,7 +234,7 @@ def linear_dynamics_tracker(
 
 
 class LinearDynamicsTracker:
-    def __init__(self, dim, eta_mean=0.05, eta_M=0.01, eta_w=0.01, store_history=False):
+    def __init__(self, dim, eta_mean=0.05, eta_M=0.01, eta_w=0.01, store_history=True):
         self.dim = dim
         self.eta_mean = eta_mean
         self.eta_M = eta_M
@@ -248,6 +247,15 @@ class LinearDynamicsTracker:
         self.p_mean = np.zeros(dim)
         self.f_mean = np.zeros(dim)
 
+        # Eigen-tracking state
+        self.l_unstable = np.random.randn(dim)  # init random
+        self.l_unstable /= np.linalg.norm(self.l_unstable)
+        self.l_stable = self.l_unstable.copy()
+        self.lambda_t = 1.0
+
+        # Noise strength
+        self.noise_strength = 0.0
+
         self.store_history = store_history
         if store_history:
             self.b_history = []
@@ -256,7 +264,39 @@ class LinearDynamicsTracker:
             self.et_history = []
             self.y_history = []
             self.xstar_history = []
-            self.At_history = []   # <-- new: store effective A_tilde
+            self.At_history = []
+            self.lu_history = []
+            self.ls_history = []
+            self.lambda_history = []
+            self.noise_history = []
+
+    def _update_left_eigenvectors(self):
+        """Update unstable eigenvector, its eigenvalue, and stable eigenvector."""
+        # Apply transformation
+        v = self.l_unstable @ self.Mfp @ self.Wpp
+
+        # Normalize to get next unstable eigenvector
+        norm_v = np.linalg.norm(v)
+        if norm_v > 1e-12:
+            self.l_unstable = v / norm_v
+
+        # Eigenvalue estimate
+        self.lambda_t = 1.0 - float(self.l_unstable @ self.l_unstable)
+
+        # Update stable eigenvector (scaled by lambda_t)
+        if abs(self.lambda_t) > 1e-12:
+            self.l_stable = v / self.lambda_t
+
+        if self.store_history:
+            self.lu_history.append(self.l_unstable.copy())
+            self.ls_history.append(self.l_stable.copy())
+            self.lambda_history.append(self.lambda_t)
+
+    def _update_noise_strength(self, et):
+        """Update noise strength as squared norm of prediction error."""
+        self.noise_strength = float(np.dot(et, et))
+        if self.store_history:
+            self.noise_history.append(self.noise_strength)
 
     def step(self, x_prev, x_t):
         self.Mfp, self.Mpf, self.p_mean, df, dp = hebbian_update_Mfp_Mpf(
@@ -273,6 +313,12 @@ class LinearDynamicsTracker:
             self.b, x_t, x_prev, self.Mfp, self.Mpf, self.Wpp
         )
 
+        # Update eigen-tracking
+        self._update_left_eigenvectors()
+
+        # Update noise strength
+        self._update_noise_strength(et)
+
         if self.store_history:
             self.b_history.append(self.b.copy())
             self.dp_history.append(dp.copy())
@@ -282,7 +328,7 @@ class LinearDynamicsTracker:
 
             # Effective system matrix
             try:
-                A_tilde = self.Mfp @ np.linalg.pinv(self.Wpp)
+                A_tilde = self.Mfp @ self.Wpp
                 self.At_history.append(A_tilde)
                 # tracker’s current fixed point
                 x_star = -np.linalg.inv(A_tilde) @ self.b
@@ -292,47 +338,3 @@ class LinearDynamicsTracker:
             self.xstar_history.append(x_star)
 
         return self.b
-
-
-    def clear_history(self):
-        """Clear stored histories (if any)."""
-        if getattr(self, "store_history", False):
-            for name in [
-                "b_history", "dp_history", "df_history", "et_history",
-                "y_history", "xstar_history", "At_history"
-            ]:
-                if hasattr(self, name):
-                    getattr(self, name).clear()
-
-    def reset(
-        self,
-        *,
-        reset_b: bool = True,
-        reset_means: bool = True,
-        reset_weights: bool = False,
-        reset_history: bool = True
-    ):
-        """
-        Reset the tracker after a trajectory restart.
-
-        Args:
-            reset_b        : zero the latent bias/state estimate b
-            reset_means    : zero EMA means (f_mean, p_mean)
-            reset_weights  : re-init learned weights (Mfp, Mpf, Wpp -> I)
-                              (set False if you want to keep learned matrices)
-            reset_history  : clear stored histories
-        """
-        if reset_b and hasattr(self, "b"):
-            self.b[:] = 0.0
-
-        if reset_means:
-            if hasattr(self, "f_mean"): self.f_mean[:] = 0.0
-            if hasattr(self, "p_mean"): self.p_mean[:] = 0.0
-
-        if reset_weights:
-            if hasattr(self, "Mfp"): self.Mfp[:] = 0.0
-            if hasattr(self, "Mpf"): self.Mpf[:] = 0.0
-            if hasattr(self, "Wpp"): self.Wpp[:] = 0.0; np.fill_diagonal(self.Wpp, 1.0)
-
-        if reset_history:
-            self.clear_history()
