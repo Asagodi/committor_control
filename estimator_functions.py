@@ -233,12 +233,13 @@ def linear_dynamics_tracker(
 
 
 
-class LinearDynamicsTracker:
-    def __init__(self, dim, eta_mean=0.05, eta_M=0.01, eta_w=0.01, store_history=True):
+class OnlineCovarianceTracker:
+    def __init__(self, dim, eta_mean=0.05, eta_M=0.01, eta_w=0.01, eta_e=0.01, store_history=True):
         self.dim = dim
         self.eta_mean = eta_mean
         self.eta_M = eta_M
         self.eta_w = eta_w
+        self.eta_e = eta_e
 
         self.b = np.zeros(dim)
         self.Mfp = np.zeros((dim, dim))
@@ -248,10 +249,10 @@ class LinearDynamicsTracker:
         self.f_mean = np.zeros(dim)
 
         # Eigen-tracking state
-        self.l_unstable = np.random.randn(dim)  # init random
+        self.l_unstable = np.random.randn(dim)
         self.l_unstable /= np.linalg.norm(self.l_unstable)
         self.l_stable = self.l_unstable.copy()
-        self.lambda_t = 1.0
+        self.lambda_t = np.random.randn(1)
 
         # Noise strength
         self.noise_strength = 0.0
@@ -264,26 +265,31 @@ class LinearDynamicsTracker:
             self.et_history = []
             self.y_history = []
             self.xstar_history = []
-            self.At_history = []
+            self.A_history = []
             self.lu_history = []
             self.ls_history = []
             self.lambda_history = []
             self.noise_history = []
 
-    def _update_left_eigenvectors(self):
-        """Update unstable eigenvector, its eigenvalue, and stable eigenvector."""
-        # Apply transformation
-        v = self.l_unstable @ self.Mfp @ self.Wpp
+            # Add plotting histories like ExponentialCovarianceTracker
+            self.pred_history = []
+            self.pred_error_history = []
 
-        # Normalize to get next unstable eigenvector
+    def _update_left_eigenvectors(self):
+        A_t = self.Mfp @ self.Wpp
+
+        # Apply power iteration step
+        v = self.l_unstable @ A_t
         norm_v = np.linalg.norm(v)
         if norm_v > 1e-12:
             self.l_unstable = v / norm_v
 
-        # Eigenvalue estimate
-        self.lambda_t = 1.0 - float(self.l_unstable @ self.l_unstable)
+        # Eigenvalue estimate via Rayleigh quotient
+        num = self.l_unstable @ (A_t @ self.l_unstable)
+        den = self.l_unstable @ self.l_unstable
+        self.lambda_t = float(num / den)
 
-        # Update stable eigenvector (scaled by lambda_t)
+        # Stable eigenvector (scaled version)
         if abs(self.lambda_t) > 1e-12:
             self.l_stable = v / self.lambda_t
 
@@ -293,10 +299,14 @@ class LinearDynamicsTracker:
             self.lambda_history.append(self.lambda_t)
 
     def _update_noise_strength(self, et):
-        """Update noise strength as squared norm of prediction error."""
-        self.noise_strength = float(np.dot(et, et))
+        new_val = float(np.dot(et, et))
+        self.noise_strength = (1 - self.eta_e) * self.noise_strength + self.eta_e * new_val
         if self.store_history:
             self.noise_history.append(self.noise_strength)
+
+    def predict(self, x_prev):
+        """Predict next state using current Mfp and Wpp."""
+        return (self.Mfp @ self.Wpp @ x_prev).ravel()
 
     def step(self, x_prev, x_t):
         self.Mfp, self.Mpf, self.p_mean, df, dp = hebbian_update_Mfp_Mpf(
@@ -319,6 +329,7 @@ class LinearDynamicsTracker:
         # Update noise strength
         self._update_noise_strength(et)
 
+        # --- Store histories for plotting ---
         if self.store_history:
             self.b_history.append(self.b.copy())
             self.dp_history.append(dp.copy())
@@ -329,12 +340,125 @@ class LinearDynamicsTracker:
             # Effective system matrix
             try:
                 A_tilde = self.Mfp @ self.Wpp
-                self.At_history.append(A_tilde)
-                # tracker’s current fixed point
+                self.A_history.append(A_tilde)
                 x_star = -np.linalg.inv(A_tilde) @ self.b
             except np.linalg.LinAlgError:
-                self.At_history.append(np.full((self.dim, self.dim), np.nan))
+                self.A_history.append(np.full((self.dim, self.dim), np.nan))
                 x_star = np.full_like(self.b, np.nan)
             self.xstar_history.append(x_star)
 
+            # Predictions & errors like ExponentialCovarianceTracker
+            x_pred = self.predict(x_prev)
+            e_pred = x_t - x_pred
+            self.pred_history.append(x_pred.copy())
+            self.pred_error_history.append(np.linalg.norm(e_pred))
+
         return self.b
+
+
+
+
+class ExponentialCovarianceTracker:
+    def __init__(self, dim, gamma=0.95, store_history=True, eta_e=0.01):
+        self.dim = dim
+        self.gamma = gamma
+        self.cov = np.eye(2*dim)        # joint covariance of [X_t; X_{t-1}]
+        self.mean = np.zeros(2*dim)     # running mean of joint vector
+        self.store_history = store_history
+
+        # Eigen-tracking
+        self.l_unstable = np.random.randn(dim)
+        self.l_unstable /= np.linalg.norm(self.l_unstable)
+        self.l_stable = self.l_unstable.copy()
+        self.lambda_t = np.random.randn(1)
+
+        # Noise strength
+        self.eta_e = eta_e
+        self.noise_strength = 0.0
+
+        # Initialize histories
+        if store_history:
+            self.pred_error_history = []
+            self.pred_history = []
+            self.A_history = []
+            self.b_history = []
+            self.lu_history = []
+            self.ls_history = []
+            self.lambda_history = []
+            self.noise_history = []
+
+    def step(self, x_t, x_prev):
+        x_t = np.asarray(x_t).reshape(-1)
+        x_prev = np.asarray(x_prev).reshape(-1)
+        z = np.concatenate([x_t, x_prev])
+        g = self.gamma
+
+        # Update mean
+        self.mean = g*self.mean + (1-g)*z
+        z0 = z - self.mean
+
+        # Update joint covariance
+        self.cov = g*self.cov + (1-g)*np.outer(z0, z0)
+
+        # Predict X_t
+        x_pred = self.predict(x_prev)
+
+        # Prediction error
+        e_t = (x_t - x_pred).ravel()
+
+        # Update noise strength (EMA of squared error norm)
+        new_val = float(np.dot(e_t, e_t))
+        self.noise_strength = (1 - self.eta_e) * self.noise_strength + self.eta_e * new_val
+
+        # Store histories
+        if self.store_history:
+            self.pred_history.append(x_pred.copy())
+            self.pred_error_history.append(np.linalg.norm(e_t))
+            self.A_history.append(self.estimate_A())
+            self.b_history.append(self.mean[:self.dim].copy())
+            self.noise_history.append(self.noise_strength)
+
+        # Update left unstable eigenvector and eigenvalue
+        self._update_left_eigenvectors()
+
+    def predict(self, x_prev):
+        """Predict X_t from X_{t-1} using block covariance"""
+        d = self.dim
+        Σ = self.cov
+        Σ_xy = Σ[:d, d:]
+        Σ_yy = Σ[d:, d:]
+        x_prev = np.asarray(x_prev).reshape(-1)
+        return (Σ_xy @ np.linalg.pinv(Σ_yy) @ x_prev).ravel()
+
+    def estimate_A(self):
+        """Return current linear map estimate"""
+        d = self.dim
+        Σ = self.cov
+        Σ_xy = Σ[:d, d:]
+        Σ_yy = Σ[d:, d:]
+        return Σ_xy @ np.linalg.pinv(Σ_yy)
+
+    def _update_left_eigenvectors(self):
+        """Update unstable eigenvector and its eigenvalue using Rayleigh quotient"""
+        A_t = self.estimate_A()
+
+        # Power iteration step
+        v = A_t.T @ self.l_unstable  # left eigenvector iteration
+        norm_v = np.linalg.norm(v)
+        if norm_v > 1e-12:
+            self.l_unstable = v / norm_v
+
+        # Rayleigh quotient for eigenvalue
+        num = self.l_unstable @ (A_t @ self.l_unstable)
+        den = self.l_unstable @ self.l_unstable
+        self.lambda_t = float(num / den)
+
+        # Stable eigenvector (scaled)
+        if abs(self.lambda_t) > 1e-12:
+            self.l_stable = v / self.lambda_t
+
+        # Store histories
+        if self.store_history:
+            self.lu_history.append(self.l_unstable.copy())
+            self.ls_history.append(self.l_stable.copy())
+            self.lambda_history.append(self.lambda_t)
