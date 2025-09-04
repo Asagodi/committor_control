@@ -462,3 +462,133 @@ class ExponentialCovarianceTracker:
             self.lu_history.append(self.l_unstable.copy())
             self.ls_history.append(self.l_stable.copy())
             self.lambda_history.append(self.lambda_t)
+
+
+
+
+#closed loop
+
+class ClosedLoopExponentialCovarianceTracker:
+    def __init__(self, dim, udim, gamma=0.95, eta_e=0.01, store_history=True):
+        self.dim = dim       # state dimension
+        self.udim = udim     # control dimension
+        self.gamma = gamma
+        self.cov = np.eye(dim + dim + udim)   # joint covariance [x_t ; x_{t-1} ; u_{t-1}]
+        self.mean = np.zeros(dim + dim + udim)
+        self.eta_e = eta_e
+        self.noise_strength = 0.0
+
+        # eigen-tracking
+        self.l_unstable = np.random.randn(dim)
+        self.l_unstable /= np.linalg.norm(self.l_unstable)
+        self.lambda_t = 0.0
+
+        self.store_history = store_history
+        if store_history:
+            self.A_history, self.B_history = [], []
+            self.pred_history, self.pred_error_history = [], []
+            self.noise_history, self.lu_history, self.lambda_history = [], [], []
+
+    def step(self, x_t, x_prev, u_prev):
+        x_t = np.asarray(x_t).reshape(-1)
+        x_prev = np.asarray(x_prev).reshape(-1)
+        u_prev = np.asarray(u_prev).reshape(-1)
+        z = np.concatenate([x_t, x_prev, u_prev])
+        g = self.gamma
+
+        # mean + covariance update
+        self.mean = g*self.mean + (1-g)*z
+        z0 = z - self.mean
+        self.cov = g*self.cov + (1-g)*np.outer(z0, z0)
+
+        # predict
+        x_pred = self.predict(x_prev, u_prev)
+        e_t = (x_t - x_pred).ravel()
+
+        # noise update
+        new_val = float(np.dot(e_t, e_t))
+        self.noise_strength = (1 - self.eta_e) * self.noise_strength + self.eta_e * new_val
+
+        # eigen-tracking
+        self._update_eigenvectors()
+
+        if self.store_history:
+            self.pred_history.append(x_pred.copy())
+            self.pred_error_history.append(np.linalg.norm(e_t))
+            self.A_history.append(self.estimate_A())
+            self.B_history.append(self.estimate_B())
+            self.noise_history.append(self.noise_strength)
+            self.lu_history.append(self.l_unstable.copy())
+            self.lambda_history.append(self.lambda_t)
+
+    def estimate_A(self):
+        d, u = self.dim, self.udim
+        Σ = self.cov
+        Σ_xx = Σ[:d, d:d+ d]
+        Σ_uu = Σ[:d, d+d:d+d+u]
+        Σ_prev = np.block([[Σ[d:d+d, d:d+d], Σ[d:d+d, d+d:d+d+u]],
+                           [Σ[d+d:d+d+u, d:d+d], Σ[d+d:d+d+u, d+d:d+d+u]]])
+        Σ_cross = np.hstack([Σ_xx, Σ_uu])
+        return Σ_cross @ np.linalg.pinv(Σ_prev)[:, :d]  # extract A
+
+    def estimate_B(self):
+        d, u = self.dim, self.udim
+        Σ = self.cov
+        Σ_xx = Σ[:d, d:d+ d]
+        Σ_uu = Σ[:d, d+d:d+d+u]
+        Σ_prev = np.block([[Σ[d:d+d, d:d+d], Σ[d:d+d, d+d:d+d+u]],
+                           [Σ[d+d:d+d+u, d:d+d], Σ[d+d:d+d+u, d+d:d+d+u]]])
+        Σ_cross = np.hstack([Σ_xx, Σ_uu])
+        return Σ_cross @ np.linalg.pinv(Σ_prev)[:, d:]  # extract B
+
+    def predict(self, x_prev, u_prev):
+        return self.estimate_A() @ x_prev + self.estimate_B() @ u_prev
+
+    def _update_eigenvectors(self):
+        A_hat = self.estimate_A()
+        v = A_hat.T @ self.l_unstable
+        norm_v = np.linalg.norm(v)
+        if norm_v > 1e-12:
+            self.l_unstable = v / norm_v
+        num = self.l_unstable @ (A_hat @ self.l_unstable)
+        den = self.l_unstable @ self.l_unstable
+        self.lambda_t = float(num / den) if abs(den) > 1e-12 else 0.0
+
+
+
+class ClosedLoopOnlineCovarianceTracker(OnlineCovarianceTracker):
+    def step(self, x_prev, u_prev, x_t):
+        # Update Hebbian estimates with control included
+        xu_prev = np.concatenate([x_prev, u_prev])
+        if not hasattr(self, "Mxu"):
+            self.Mxu = np.zeros((self.dim, len(xu_prev)))  # joint regression weights
+
+        # Hebbian update for Mxu
+        self.Mxu = (1 - self.eta_M)*self.Mxu + self.eta_M*np.outer(x_t, xu_prev)
+
+        # Predict
+        x_pred = self.Mxu @ xu_prev
+        e_t = x_t - x_pred
+
+        # Noise update
+        self._update_noise_strength(e_t)
+
+        # Eigen update (on A block of Mxu)
+        A_hat = self.Mxu[:, :self.dim]
+        v = A_hat.T @ self.l_unstable
+        norm_v = np.linalg.norm(v)
+        if norm_v > 1e-12:
+            self.l_unstable = v / norm_v
+        num = self.l_unstable @ (A_hat @ self.l_unstable)
+        den = self.l_unstable @ self.l_unstable
+        self.lambda_t = float(num / den) if abs(den) > 1e-12 else 0.0
+
+        if self.store_history:
+            self.pred_history.append(x_pred.copy())
+            self.pred_error_history.append(np.linalg.norm(e_t))
+            self.A_history.append(A_hat.copy())
+            self.b_history.append(self.Mxu[:, self.dim:].copy())
+            self.lu_history.append(self.l_unstable.copy())
+            self.lambda_history.append(self.lambda_t)
+
+        return self.Mxu
