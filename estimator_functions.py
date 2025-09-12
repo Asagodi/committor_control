@@ -232,14 +232,14 @@ def linear_dynamics_tracker(
     return b_new, Mfp_new, Mpf_new, Wpp_new, f_mean_new, p_mean_new, dp, df, et
 
 
-
 class OnlineCovarianceTracker:
-    def __init__(self, dim, eta_mean=0.05, eta_M=0.01, eta_w=0.01, eta_e=0.01, store_history=True):
+    def __init__(self, dim, eta_mean=0.05, eta_M=0.01, eta_w=0.01, eta_e=0.01, n_iter_lu=10, store_history=True):
         self.dim = dim
         self.eta_mean = eta_mean
         self.eta_M = eta_M
         self.eta_w = eta_w
         self.eta_e = eta_e
+        self.n_iter_lu = n_iter_lu
 
         self.b = np.zeros(dim)
         self.Mfp = np.zeros((dim, dim))
@@ -275,27 +275,41 @@ class OnlineCovarianceTracker:
             self.pred_history = []
             self.pred_error_history = []
 
-    def _update_left_eigenvectors(self):
+    def _update_left_eigenvectors(self, n_iter=10, tol=1e-12):
         A_t = self.Mfp @ self.Wpp
 
-        # Apply power iteration step
-        v = self.l_unstable @ A_t
-        norm_v = np.linalg.norm(v)
-        if norm_v > 1e-12:
-            self.l_unstable = v / norm_v
+        v = self.l_unstable.copy()
 
-        # Eigenvalue estimate via Rayleigh quotient
-        num = self.l_unstable @ (A_t @ self.l_unstable)
+        # Power iteration with multiple steps for stability
+        for _ in range(n_iter):
+            v_new = A_t.T @ v
+            norm_v = np.linalg.norm(v_new)
+            if norm_v < tol:
+                break  # Avoid collapse
+            v_new /= norm_v
+
+            if np.linalg.norm(v_new - v) < tol:
+                v = v_new
+                break
+
+            v = v_new
+
+        self.l_unstable = v
+
+        # Rayleigh quotient for eigenvalue
+        Av = A_t @ self.l_unstable
+        num = self.l_unstable @ Av
         den = self.l_unstable @ self.l_unstable
         self.lambda_t = float(num / den)
 
-        # Stable eigenvector (scaled version)
-        if abs(self.lambda_t) > 1e-12:
-            self.l_stable = v / self.lambda_t
+        # # Stable eigenvector (scaled)
+        # if abs(self.lambda_t) > tol:
+        #     self.l_stable = v / self.lambda_t
 
+        # Store histories
         if self.store_history:
             self.lu_history.append(self.l_unstable.copy())
-            self.ls_history.append(self.l_stable.copy())
+            #self.ls_history.append(self.l_stable.copy())
             self.lambda_history.append(self.lambda_t)
 
     def _update_noise_strength(self, et):
@@ -324,7 +338,7 @@ class OnlineCovarianceTracker:
         )
 
         # Update eigen-tracking
-        self._update_left_eigenvectors()
+        self._update_left_eigenvectors(n_iter=self.n_iter_lu)
 
         # Update noise strength
         self._update_noise_strength(et)
@@ -359,7 +373,7 @@ class OnlineCovarianceTracker:
 
 
 class ExponentialCovarianceTracker:
-    def __init__(self, dim, gamma=0.95, store_history=True, eta_e=0.01):
+    def __init__(self, dim, gamma=0.95, eta_e=0.01, store_history=True):
         self.dim = dim
         self.gamma = gamma
         self.cov = np.eye(2*dim)        # joint covariance of [X_t; X_{t-1}]
@@ -438,23 +452,35 @@ class ExponentialCovarianceTracker:
         Σ_yy = Σ[d:, d:]
         return Σ_xy @ np.linalg.pinv(Σ_yy)
 
-    def _update_left_eigenvectors(self):
-        """Update unstable eigenvector and its eigenvalue using Rayleigh quotient"""
+    def _update_left_eigenvectors(self, n_iter=10, tol=1e-12):
+        """Update unstable eigenvector and its eigenvalue using Rayleigh quotient with multiple iterations"""
         A_t = self.estimate_A()
+        v = self.l_unstable.copy()
 
-        # Power iteration step
-        v = A_t.T @ self.l_unstable  # left eigenvector iteration
-        norm_v = np.linalg.norm(v)
-        if norm_v > 1e-12:
-            self.l_unstable = v / norm_v
+        # Power iteration with multiple steps for stability
+        for _ in range(n_iter):
+            v_new = A_t.T @ v
+            norm_v = np.linalg.norm(v_new)
+            if norm_v < tol:
+                break  # Avoid collapse
+            v_new /= norm_v
+
+            if np.linalg.norm(v_new - v) < tol:
+                v = v_new
+                break
+
+            v = v_new
+
+        self.l_unstable = v
 
         # Rayleigh quotient for eigenvalue
-        num = self.l_unstable @ (A_t @ self.l_unstable)
+        Av = A_t @ self.l_unstable
+        num = self.l_unstable @ Av
         den = self.l_unstable @ self.l_unstable
         self.lambda_t = float(num / den)
 
         # Stable eigenvector (scaled)
-        if abs(self.lambda_t) > 1e-12:
+        if abs(self.lambda_t) > tol:
             self.l_stable = v / self.lambda_t
 
         # Store histories
@@ -462,6 +488,7 @@ class ExponentialCovarianceTracker:
             self.lu_history.append(self.l_unstable.copy())
             self.ls_history.append(self.l_stable.copy())
             self.lambda_history.append(self.lambda_t)
+
 
 
 
