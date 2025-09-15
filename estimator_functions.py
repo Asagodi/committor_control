@@ -233,12 +233,13 @@ def linear_dynamics_tracker(
 
 
 class OnlineCovarianceTracker:
-    def __init__(self, dim, eta_mean=0.05, eta_M=0.01, eta_w=0.01, eta_e=0.01, n_iter_lu=10, store_history=True):
+    def __init__(self, dim, eta_mean=0.05, eta_M=0.01, eta_w=0.01, eta_e=0.01, eta_v=1., n_iter_lu=10, store_history=True):
         self.dim = dim
         self.eta_mean = eta_mean
         self.eta_M = eta_M
         self.eta_w = eta_w
         self.eta_e = eta_e
+        self.eta_v = eta_v
         self.n_iter_lu = n_iter_lu
 
         self.b = np.zeros(dim)
@@ -294,7 +295,8 @@ class OnlineCovarianceTracker:
 
             v = v_new
 
-        self.l_unstable = v
+        #self.l_unstable = v
+        self.l_unstable = (1 - self.eta_v) * self.l_unstable + self.eta_v * v
 
         # Rayleigh quotient for eigenvalue
         Av = A_t @ self.l_unstable
@@ -407,15 +409,19 @@ class ExponentialCovarianceTracker:
         z = np.concatenate([x_t, x_prev])
         g = self.gamma
 
-        # Update mean
+        # Update joint mean
         self.mean = g*self.mean + (1-g)*z
         z0 = z - self.mean
 
         # Update joint covariance
         self.cov = g*self.cov + (1-g)*np.outer(z0, z0)
 
-        # Predict X_t
-        x_pred = self.predict(x_prev)
+        # Predict X_t using current estimate of A and b
+        A_hat = self.estimate_A()
+        mean_x_t = self.mean[:self.dim]
+        mean_x_prev = self.mean[self.dim:]
+        b_hat = mean_x_t - A_hat @ mean_x_prev
+        x_pred = A_hat @ x_prev + b_hat
 
         # Prediction error
         e_t = (x_t - x_pred).ravel()
@@ -428,8 +434,8 @@ class ExponentialCovarianceTracker:
         if self.store_history:
             self.pred_history.append(x_pred.copy())
             self.pred_error_history.append(np.linalg.norm(e_t))
-            self.A_history.append(self.estimate_A())
-            self.b_history.append(self.mean[:self.dim].copy())
+            self.A_history.append(A_hat)
+            self.b_history.append(b_hat.copy())
             self.noise_history.append(self.noise_strength)
 
         # Update left unstable eigenvector and eigenvalue
