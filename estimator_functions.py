@@ -374,6 +374,8 @@ class OnlineCovarianceTracker:
 
 
 
+import numpy as np
+
 class ExponentialCovarianceTracker:
     def __init__(self, dim, gamma=0.95, eta_e=0.01, store_history=True):
         self.dim = dim
@@ -463,12 +465,12 @@ class ExponentialCovarianceTracker:
         A_t = self.estimate_A()
         v = self.l_unstable.copy()
 
-        # Power iteration with multiple steps for stability
+        # Power iteration
         for _ in range(n_iter):
             v_new = A_t.T @ v
             norm_v = np.linalg.norm(v_new)
             if norm_v < tol:
-                break  # Avoid collapse
+                break
             v_new /= norm_v
 
             if np.linalg.norm(v_new - v) < tol:
@@ -479,13 +481,13 @@ class ExponentialCovarianceTracker:
 
         self.l_unstable = v
 
-        # Rayleigh quotient for eigenvalue
+        # Rayleigh quotient
         Av = A_t @ self.l_unstable
         num = self.l_unstable @ Av
         den = self.l_unstable @ self.l_unstable
         self.lambda_t = float(num / den)
 
-        # Stable eigenvector (scaled)
+        # Stable eigenvector
         if abs(self.lambda_t) > tol:
             self.l_stable = v / self.lambda_t
 
@@ -494,6 +496,42 @@ class ExponentialCovarianceTracker:
             self.lu_history.append(self.l_unstable.copy())
             self.ls_history.append(self.l_stable.copy())
             self.lambda_history.append(self.lambda_t)
+
+    def train(self, drift_func, n_trajs=200, T=100, dt=0.01, D=0.1, x_shift=0.0, y_shift=0.0, seed=20):
+        """
+        Simulate trajectories under drift dynamics and update tracker online.
+
+        Returns
+        -------
+        all_X_uncontrolled : list[np.ndarray]
+            List of simulated trajectories (each shape (T, dim)).
+        """
+        def D_to_noise_std(D):
+            return np.sqrt(2 * D)
+
+        noise_std = D_to_noise_std(D)
+
+        rng = np.random.default_rng(seed)
+        initial_positions = [
+            np.array([x_shift, y_shift]) + rng.uniform(-0.1, 0.1, size=(self.dim,))
+            for _ in range(n_trajs)
+        ]
+
+        all_X_uncontrolled = []
+        for x0 in initial_positions:
+            X = np.zeros((T, self.dim))
+            X[0] = x0
+
+            for t in range(1, T):
+                dx = drift_func(t, X[t - 1])
+                X[t] = (
+                    X[t - 1] + dx * dt + noise_std * rng.standard_normal(self.dim) * np.sqrt(dt)
+                )
+                self.step(X[t], X[t - 1])
+
+            all_X_uncontrolled.append(X)
+
+        return all_X_uncontrolled
 
 
 
