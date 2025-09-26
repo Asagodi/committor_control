@@ -232,6 +232,353 @@ def linear_dynamics_tracker(
     return b_new, Mfp_new, Mpf_new, Wpp_new, f_mean_new, p_mean_new, dp, df, et
 
 
+
+import numpy as np
+
+class NaiveVARTracker:
+    def __init__(self, dim, eta_e=0.01, store_history=True):
+        self.dim = dim
+        self.eta_e = eta_e
+        self.store_history = store_history
+
+        # Data storage (optional — still keep points if you like)
+        self.data = []
+
+        # Explicit transitions (pairs inside same trajectory)
+        self.pairs = []  # list of (x_prev, x_curr)
+
+        # Helper to know last point of the *current* trajectory
+        self._last_point = None
+
+        # Model parameters
+        self.A = np.eye(dim)
+        self.b = np.zeros(dim)
+        self.residual_cov = np.eye(dim)
+
+        # Eigen-tracking
+        v = np.random.randn(dim)
+        v /= np.linalg.norm(v)
+        self.l_unstable = v.copy()
+        self.l_stable = v.copy()
+        self.lambda_t = 0.0
+
+        # Noise strength (EMA of squared error norm)
+        self.noise_strength = 0.0
+
+        # Histories
+        if store_history:
+            self.pred_history = []
+            self.pred_error_history = []
+            self.A_history = []
+            self.b_history = []
+            self.noise_history = []
+            self.residual_cov_history = []
+            self.lu_history = []
+            self.ls_history = []
+            self.lambda_history = []
+
+    def update(self, x_t, new_trajectory=False):
+        """
+        Add a new observation.
+        If new_trajectory is True, this point is considered the start of a new trajectory
+        (no pair is formed with the previous global point).
+        """
+        x_t = np.asarray(x_t).ravel()
+        self.data.append(x_t.copy())
+
+        if new_trajectory:
+            # mark start of a new trajectory: don't create a pair
+            self._last_point = x_t.copy()
+            return
+
+        if self._last_point is None:
+            # no previous point available (first ever point) — treat as start
+            self._last_point = x_t.copy()
+            return
+
+        # otherwise form a pair inside the same trajectory
+        self.pairs.append((self._last_point.copy(), x_t.copy()))
+        self._last_point = x_t.copy()
+
+        # need at least 1 pair to estimate
+        if len(self.pairs) < 1:
+            return
+
+        X_p = np.vstack([p[0] for p in self.pairs])  # shape (n_pairs, dim)
+        X_f = np.vstack([p[1] for p in self.pairs])  # shape (n_pairs, dim)
+        n = X_p.shape[0]
+
+        # Means
+        mean_p = X_p.mean(axis=0)
+        mean_f = X_f.mean(axis=0)
+
+        # Covariances (population-style normalization by n)
+        X_p0 = X_p - mean_p
+        X_f0 = X_f - mean_f
+        C_pp = (X_p0.T @ X_p0) / n
+        C_fp = (X_f0.T @ X_p0) / n
+
+        # VAR parameters
+        A_hat = C_fp @ np.linalg.pinv(C_pp)
+        b_hat = mean_f - A_hat @ mean_p
+
+        # Residuals and residual covariance
+        pred = X_p @ A_hat.T + b_hat  # (n, dim)
+        residuals = X_f - pred
+        residual_cov = (residuals.T @ residuals) / n
+        mse = float(np.mean(np.sum(residuals**2, axis=1)))
+
+        # Update state
+        self.A = A_hat
+        self.b = b_hat
+        self.residual_cov = residual_cov
+        self.noise_strength = (1 - self.eta_e) * self.noise_strength + self.eta_e * mse
+
+        # Store histories
+        if self.store_history:
+            self.A_history.append(A_hat.copy())
+            self.b_history.append(b_hat.copy())
+            self.pred_history.append(pred[-1].copy())
+            self.pred_error_history.append(np.sqrt(mse))
+            self.noise_history.append(self.noise_strength)
+            self.residual_cov_history.append(residual_cov.copy())
+
+        # Update eigen-tracking
+        self._update_left_eigenvectors()
+
+    def _update_left_eigenvectors(self, n_iter=20, tol=1e-12):
+        if self.A is None:
+            return
+        A_t = self.A
+        v = self.l_unstable.copy()
+        for _ in range(n_iter):
+            v_new = A_t.T @ v
+            norm_v = np.linalg.norm(v_new)
+            if norm_v < tol:
+                break
+            v_new /= norm_v
+            if np.linalg.norm(v_new - v) < tol:
+                v = v_new
+                break
+            v = v_new
+        self.l_unstable = v
+        Av = A_t @ v
+        den = v @ v
+        self.lambda_t = (v @ Av) / den if den > tol else 0.0
+        # alternative:
+        self.lambda_t = np.linalg.norm(Av)
+        if abs(self.lambda_t) > tol:
+            self.l_stable = v / self.lambda_t
+        if self.store_history:
+            self.lu_history.append(self.l_unstable.copy())
+            self.ls_history.append(self.l_stable.copy())
+            self.lambda_history.append(self.lambda_t)
+
+    def train(self, drift_func, n_trajs=200, T=100, dt=0.01, D=0.1,
+              x_shift=0.0, y_shift=0.0, seed=20, init_bounds=0.1):
+        """Simulate trajectories and update parameters, signalling new trajectories correctly."""
+        def D_to_noise_std(D):
+            return np.sqrt(2 * D)
+
+        noise_std = D_to_noise_std(D)
+        rng = np.random.default_rng(seed)
+
+        # Initialize trajectories
+        initial_positions = [
+            np.array([x_shift, y_shift]) + rng.uniform(-init_bounds, init_bounds, size=(self.dim,))
+            for _ in range(n_trajs)
+        ]
+
+        all_X_uncontrolled = []
+        for x0 in initial_positions:
+            X = np.zeros((T, self.dim))
+            X[0] = x0
+            # Start new trajectory so tracker won't pair x0 with previous trajectory's last point
+            self.update(X[0], new_trajectory=True)
+            for t in range(1, T):
+                dx = drift_func(t, X[t-1])
+                X[t] = X[t-1] + dx * dt + noise_std * rng.standard_normal(self.dim) * np.sqrt(dt)
+                self.update(X[t])  # pairs formed only within this trajectory
+            all_X_uncontrolled.append(X)
+
+        return all_X_uncontrolled
+
+    # Utilities
+    def predict(self, x_prev):
+        return self.A @ x_prev + self.b
+
+    def get_latest_params(self):
+        return self.A, self.b, self.residual_cov
+
+
+
+
+class OfflineVARTrackerBatched:
+    """
+    Offline least-squares VAR(1) estimator.
+    Estimates A, b, eigenvectors, eigenvalues, and residual covariance
+    using closed-form sample covariances on groups of trajectories.
+    """
+
+    def __init__(self, dim, eta_e=0.01, store_history=True):
+        self.dim = int(dim)
+        self.eta_e = float(eta_e)
+        self.store_history = bool(store_history)
+
+        # Parameters / state
+        self.mean = np.zeros(2 * self.dim)     # joint mean [x_t; x_{t-1}]
+        self.cov = np.eye(2 * self.dim)        # joint covariance
+
+        # Eigen-tracking state
+        v = np.random.randn(self.dim)
+        v /= np.linalg.norm(v)
+        self.l_unstable = v.copy()
+        self.l_stable = v.copy()
+        self.lambda_t = 0.0
+
+        # Noise strength (EMA of squared error norm)
+        self.noise_strength = 0.0
+
+        # Histories
+        if self.store_history:
+            self.pred_error_history = []
+            self.pred_history = []
+            self.A_history = []
+            self.b_history = []
+            self.lu_history = []
+            self.ls_history = []
+            self.lambda_history = []
+            self.noise_history = []
+            self.residual_cov_history = []
+
+    def offline_train(self, all_X, n_traj_cov=50):
+        n_trajs = len(all_X)
+        n_groups = n_trajs // n_traj_cov
+        if n_groups == 0:
+            raise ValueError("Not enough trajectories for one group")
+
+        A_list, b_list = [], []
+
+        for g in range(n_groups):
+            group = all_X[g * n_traj_cov:(g + 1) * n_traj_cov]
+
+            X_p, X_f = [], []
+            for X in group:
+                X_p.append(X[:-1])
+                X_f.append(X[1:])
+            X_p = np.vstack(X_p)
+            X_f = np.vstack(X_f)
+            N = X_p.shape[0]
+
+            # Means
+            mean_p = X_p.mean(axis=0)
+            mean_f = X_f.mean(axis=0)
+
+            # Covariances
+            X_p0 = X_p - mean_p
+            X_f0 = X_f - mean_f
+            C_pp = (X_p0.T @ X_p0) / N
+            C_fp = (X_f0.T @ X_p0) / N
+
+            # Closed-form estimates
+            A_hat = C_fp @ np.linalg.pinv(C_pp)
+            b_hat = mean_f - A_hat @ mean_p
+
+            # Residuals
+            pred = X_p @ A_hat.T + b_hat
+            residuals = X_f - pred
+            residual_cov = (residuals.T @ residuals) / N
+            mse = float(np.mean(np.sum(residuals ** 2, axis=1)))
+
+            # Joint mean/covariance for [x_t; x_{t-1}]
+            mean_joint = np.concatenate([mean_f, mean_p])
+            Z0 = np.hstack([X_f0, X_p0])
+            cov_joint = (Z0.T @ Z0) / N
+            self.mean = mean_joint
+            self.cov = cov_joint
+
+            # Update noise estimate
+            self.noise_strength = (1 - self.eta_e) * self.noise_strength + self.eta_e * mse
+
+            # Store
+            A_list.append(A_hat)
+            b_list.append(b_hat)
+            if self.store_history:
+                self.A_history.append(A_hat.copy())
+                self.b_history.append(b_hat.copy())
+                self.pred_history.append(pred.mean(axis=0).copy())
+                self.pred_error_history.append(np.sqrt(mse))
+                self.noise_history.append(self.noise_strength)
+                self.residual_cov_history.append(residual_cov.copy())
+
+            # Update eigen-tracking
+            self._update_left_eigenvectors()
+
+        return A_list, b_list
+
+    def _update_left_eigenvectors(self, n_iter=20, tol=1e-12):
+        if not self.A_history:
+            return
+        A_t = self.A_history[-1]
+        v = self.l_unstable.copy()
+        for _ in range(n_iter):
+            v_new = A_t.T @ v
+            norm_v = np.linalg.norm(v_new)
+            if norm_v < tol:
+                break
+            v_new /= norm_v
+            if np.linalg.norm(v_new - v) < tol:
+                v = v_new
+                break
+            v = v_new
+        self.l_unstable = v
+        Av = A_t @ v
+        den = v @ v
+        self.lambda_t = (v @ Av) / den if den > tol else 0.0
+        if abs(self.lambda_t) > tol:
+            self.l_stable = v / self.lambda_t
+        if self.store_history:
+            self.lu_history.append(self.l_unstable.copy())
+            self.ls_history.append(self.l_stable.copy())
+            self.lambda_history.append(self.lambda_t)
+
+    def train(self, drift_func, n_trajs=200, T=100, dt=0.01, D=0.1,
+              x_shift=0.0, y_shift=0.0, seed=20, n_traj_cov=50, init_bounds=0.1):
+        def D_to_noise_std(D):
+            return np.sqrt(2 * D)
+
+        noise_std = D_to_noise_std(D)
+        rng = np.random.default_rng(seed)
+
+        # initialize trajectories
+        initial_positions = [
+            np.array([x_shift, y_shift]) + rng.uniform(-init_bounds, init_bounds, size=(self.dim,))
+            for _ in range(n_trajs)
+        ]
+
+        all_X_uncontrolled = []
+        for x0 in initial_positions:
+            X = np.zeros((T, self.dim))
+            X[0] = x0
+            for t in range(1, T):
+                dx = drift_func(t, X[t-1])
+                X[t] = X[t-1] + dx*dt + noise_std*rng.standard_normal(self.dim)*np.sqrt(dt)
+            all_X_uncontrolled.append(X)
+
+        # Offline VAR estimation in groups
+        self.offline_train(all_X_uncontrolled, n_traj_cov=n_traj_cov)
+        return all_X_uncontrolled
+
+    # ---------------- utilities ----------------
+    def predict_from_params(self, A, b, x_prev):
+        return (A @ x_prev + b).ravel()
+
+    def get_latest_A_b(self):
+        if not self.A_history:
+            return None, None
+        return self.A_history[-1], self.b_history[-1]
+
+
 class OnlineCovarianceTracker:
     def __init__(self, dim, eta_mean=0.05, eta_M=0.01, eta_w=0.01, eta_e=0.01, eta_v=1., n_iter_lu=10, store_history=True):
         self.dim = dim
@@ -374,7 +721,6 @@ class OnlineCovarianceTracker:
 
 
 
-import numpy as np
 
 class ExponentialCovarianceTracker:
     def __init__(self, dim, gamma=0.95, eta_e=0.01, store_history=True):
@@ -497,7 +843,7 @@ class ExponentialCovarianceTracker:
             self.ls_history.append(self.l_stable.copy())
             self.lambda_history.append(self.lambda_t)
 
-    def train(self, drift_func, n_trajs=200, T=100, dt=0.01, D=0.1, x_shift=0.0, y_shift=0.0, seed=20):
+    def train(self, drift_func, n_trajs=200, T=100, dt=0.01, D=0.1, x_shift=0.0, y_shift=0.0, seed=20, init_bounds=0.1):
         """
         Simulate trajectories under drift dynamics and update tracker online.
 
@@ -513,7 +859,7 @@ class ExponentialCovarianceTracker:
 
         rng = np.random.default_rng(seed)
         initial_positions = [
-            np.array([x_shift, y_shift]) + rng.uniform(-0.1, 0.1, size=(self.dim,))
+            np.array([x_shift, y_shift]) + rng.uniform(-init_bounds, init_bounds, size=(self.dim,))
             for _ in range(n_trajs)
         ]
 
