@@ -233,8 +233,7 @@ def linear_dynamics_tracker(
 
 
 
-import numpy as np
-
+# Trackers  
 class NaiveVARTracker:
     def __init__(self, dim, eta_e=0.01, store_history=True):
         self.dim = dim
@@ -312,11 +311,11 @@ class NaiveVARTracker:
         mean_p = X_p.mean(axis=0)
         mean_f = X_f.mean(axis=0)
 
-        # Covariances (population-style normalization by n)
+        # Covariances 
         X_p0 = X_p - mean_p
         X_f0 = X_f - mean_f
-        C_pp = (X_p0.T @ X_p0) / n
-        C_fp = (X_f0.T @ X_p0) / n
+        C_pp = (X_p0.T @ X_p0) #/ n
+        C_fp = (X_f0.T @ X_p0) #/ n
 
         # VAR parameters
         A_hat = C_fp @ np.linalg.pinv(C_pp)
@@ -332,7 +331,7 @@ class NaiveVARTracker:
         self.A = A_hat
         self.b = b_hat
         self.residual_cov = residual_cov
-        self.noise_strength = (1 - self.eta_e) * self.noise_strength + self.eta_e * mse
+        self.noise_strength = mse
 
         # Store histories
         if self.store_history:
@@ -346,7 +345,7 @@ class NaiveVARTracker:
         # Update eigen-tracking
         self._update_left_eigenvectors()
 
-    def _update_left_eigenvectors(self, n_iter=20, tol=1e-12):
+    def _update_left_eigenvectors(self, n_iter=1, tol=1e-12):
         if self.A is None:
             return
         A_t = self.A
@@ -410,6 +409,374 @@ class NaiveVARTracker:
     def get_latest_params(self):
         return self.A, self.b, self.residual_cov
 
+
+## Neighborhood based VAR tracker with fixed point tracking
+class NbhdVARTracker:
+    """
+    Neighborhood VAR tracker (batch / offline version).
+
+    Offline training:
+      1) generate n_trajs trajectories
+      2) build all past-future pairs
+      3) starting from x_star (x_star_init or random within [-x_star_init_range, x_star_init_range]^dim), iterate n_iterations times:
+           - select pairs within radius of x_star
+           - compute local A_hat, b_hat, residuals
+           - update x_star via x_star = (I - A)^-1 (mean_f - A mean_p)
+      Histories are recorded for all iterations, with **initial values as the first entry**.
+    """
+
+    def __init__(self, dim,
+                 store_history=True,
+                 x_star_init=None,
+                 x_star_init_range=None,
+                 radius=None,
+                 rng_seed=None):
+        self.dim = int(dim)
+        self.store_history = bool(store_history)
+
+        # Model state
+        self.A = np.eye(self.dim, dtype=float)
+        self.b = np.zeros(self.dim, dtype=float)
+        self.residual_cov = np.eye(self.dim, dtype=float)
+        self.noise_strength = np.random.rand()*0.00001
+
+        # Random generator
+        self.rng = np.random.default_rng(rng_seed)
+
+        # Fixed point / neighborhood
+        self.radius = None if radius is None else float(radius)
+        if x_star_init is None:
+            if self.radius is None:
+                self.x_star = np.zeros(self.dim, dtype=float)
+            else:
+                if x_star_init_range is None:
+                    x_star_init_range = self.radius
+                self.x_star = self.rng.uniform(-x_star_init_range, x_star_init_range, size=self.dim)
+        else:
+            self.x_star = np.asarray(x_star_init, dtype=float).ravel()
+
+        # Pair storage
+        self.pairs = []
+
+        # Eigen-tracking
+        v = self.rng.standard_normal(self.dim)
+        v /= (np.linalg.norm(v) + 1e-12)
+        self.l_unstable = v.copy()
+        self.l_stable = v.copy()
+        self.lambda_t = 0.
+
+        # Histories (initial values included)
+        if self.store_history:
+            self.A_history = [self.A.copy()]
+            self.b_history = [self.b.copy()]
+            self.residual_cov_history = [self.residual_cov.copy()]
+            self.noise_history = [self.noise_strength]
+
+            self.lu_history = [self.l_unstable.copy()]
+            self.ls_history = [self.l_stable.copy()]
+            self.lambda_history = [self.lambda_t]
+            self.xstar_history = [self.x_star.copy()]
+            self.nlocal_history = [0]
+
+    # -----------------------------
+    # Build pairs from trajectories
+    # -----------------------------
+    def _compute_all_pairs_from_trajectories(self, all_X):
+        self.pairs = []
+        for X in all_X:
+            X = np.asarray(X)
+            for t in range(X.shape[0] - 1):
+                self.pairs.append((X[t].copy(), X[t+1].copy()))
+
+    # -----------------------------
+    # Estimate VAR from local pairs
+    # -----------------------------
+    def _estimate_VAR_from_pairs(self, local_pairs):
+        X_p = np.vstack([p[0] for p in local_pairs])
+        X_f = np.vstack([p[1] for p in local_pairs])
+        n = X_p.shape[0]
+
+        mean_p = X_p.mean(axis=0)
+        mean_f = X_f.mean(axis=0)
+
+        X_p0 = X_p - mean_p
+        X_f0 = X_f - mean_f
+
+        C_pp = X_p0.T @ X_p0
+        C_fp = X_f0.T @ X_p0
+
+        A_hat = C_fp @ np.linalg.pinv(C_pp)
+        b_hat = mean_f - A_hat @ mean_p
+
+        pred = X_p @ A_hat.T + b_hat
+        residuals = X_f - pred
+        residual_cov = (residuals.T @ residuals) / max(n, 1)
+        mse = float(np.mean(np.sum(residuals**2, axis=1)))
+
+        return A_hat, b_hat, residual_cov, mse, mean_p, mean_f
+
+    # -----------------------------
+    # Left-eigenvector update
+    # -----------------------------
+    def _update_left_eigenvectors(self, A, n_iter=20, tol=1e-12):
+        v = self.l_unstable.copy()
+        for _ in range(n_iter):
+            v_new = A.T @ v
+            nrm = np.linalg.norm(v_new)
+            if nrm <= tol:
+                break
+            v_new /= nrm
+            if np.linalg.norm(v_new - v) < tol:
+                v = v_new
+                break
+            v = v_new
+
+        self.l_unstable = v.copy()
+        Av = A @ v
+        den = max(v @ v, 1e-12)
+        lambda_est = float((v @ Av) / den)
+        self.lambda_t = lambda_est
+        self.l_stable = v / (lambda_est if abs(lambda_est) > 1e-12 else 1.0)
+
+        if self.store_history:
+            self.lu_history.append(self.l_unstable.copy())
+            self.ls_history.append(self.l_stable.copy())
+            self.lambda_history.append(self.lambda_t)
+
+    # -----------------------------
+    # Offline training
+    # -----------------------------
+    def train(self, drift_func,
+              n_trajs=200, T=100, dt=0.01, D=0.1,
+              x_shift=0.0, y_shift=0.0, seed=0, init_bounds=0.1,
+              n_iterations=15, min_pairs=None,
+              return_trajectories=False):
+        def noise_std(D):
+            return np.sqrt(2.0 * D)
+
+        rng = np.random.default_rng(seed)
+        all_X = []
+
+        # generate trajectories
+        for _ in range(int(n_trajs)):
+            X = np.zeros((int(T), self.dim), dtype=float)
+            X[0] = np.array([x_shift, y_shift]) + rng.uniform(-init_bounds, init_bounds, size=self.dim)
+            for t in range(1, int(T)):
+                dx = drift_func(t, X[t-1])
+                X[t] = X[t-1] + dx * dt + noise_std(D) * rng.standard_normal(self.dim) * np.sqrt(dt)
+            all_X.append(X)
+
+        # build all pairs
+        self._compute_all_pairs_from_trajectories(all_X)
+
+        if min_pairs is None:
+            min_pairs = max(self.dim + 1, 5)
+
+        # global fit if radius is None
+        if self.radius is None:
+            A_hat, b_hat, resid_cov, mse, _, _ = self._estimate_VAR_from_pairs(self.pairs)
+            self.A, self.b, self.residual_cov = A_hat, b_hat, resid_cov
+            self.noise_strength = mse
+            self._update_left_eigenvectors(self.A)
+            if self.store_history:
+                self.A_history.append(self.A.copy())
+                self.b_history.append(self.b.copy())
+                self.residual_cov_history.append(self.residual_cov.copy())
+                self.noise_history.append(self.noise_strength)
+                self.xstar_history.append(self.x_star.copy())
+                self.nlocal_history.append(len(self.pairs))
+            return all_X if return_trajectories else None
+
+        # iterative local-fitting loop (ignore x_star convergence)
+        A_hat = self.A.copy()
+        b_hat = self.b.copy()
+        resid_cov = self.residual_cov.copy()
+        mse = self.noise_strength
+
+        for it in range(int(n_iterations)):
+            # select local pairs
+            local_pairs = [(xp.copy(), xf.copy()) for (xp, xf) in self.pairs
+                           if np.linalg.norm(xp - self.x_star) <= self.radius]
+            n_local = len(local_pairs)
+            if self.store_history:
+                self.nlocal_history.append(n_local)
+
+            if n_local < min_pairs:
+                # not enough pairs, record history and skip estimation
+                if self.store_history:
+                    self.xstar_history.append(self.x_star.copy())
+                    self.A_history.append(A_hat.copy())
+                    self.b_history.append(b_hat.copy())
+                    self.residual_cov_history.append(resid_cov.copy())
+                    self.noise_history.append(mse)
+                    self._update_left_eigenvectors(A_hat)
+                continue
+
+            # estimate local VAR
+            A_hat, b_hat, resid_cov, mse, mean_p, mean_f = self._estimate_VAR_from_pairs(local_pairs)
+
+            # update x_star
+            I_minus_A = np.eye(self.dim) - A_hat
+            try:
+                x_star_new = np.linalg.solve(I_minus_A, mean_f - A_hat @ mean_p)
+            except np.linalg.LinAlgError:
+                x_star_new = np.linalg.pinv(I_minus_A) @ (mean_f - A_hat @ mean_p)
+            
+            self.x_star = x_star_new.copy()
+
+            # update eigenvectors and record history
+            self._update_left_eigenvectors(A_hat)
+            if self.store_history:
+                self.A_history.append(A_hat.copy())
+                self.b_history.append(b_hat.copy())
+                self.residual_cov_history.append(resid_cov.copy())
+                self.noise_history.append(mse)
+                self.xstar_history.append(self.x_star.copy())
+
+        # assign final parameters
+        self.A, self.b, self.residual_cov, self.noise_strength = A_hat, b_hat, resid_cov, mse
+
+        return all_X if return_trajectories else None
+
+    # -----------------------------
+    # Predict / getters
+    # -----------------------------
+    def predict(self, x_prev):
+        x_prev = np.asarray(x_prev).ravel()
+        return self.A @ x_prev + self.b
+
+    def get_latest_params(self):
+        return self.A.copy(), self.b.copy(), self.residual_cov.copy()
+
+
+
+    
+    # def enable_fixed_point_tracking(self, x_star_init, radius):
+    #     """
+    #     Enable fixed point tracking with given initial estimate and radius.
+    #     After calling this, fixed point will be updated with each new observation.
+        
+    #     Parameters:
+    #     -----------
+    #     x_star_init : array-like
+    #         Initial guess for the fixed point
+    #     radius : float
+    #         Fixed radius for the neighborhood around the fixed point
+    #     """
+    #     self.x_star = np.asarray(x_star_init).ravel().copy()
+    #     self.radius = radius
+    #     if self.store_history:
+    #         self.xstar_history = [self.x_star.copy()]
+
+    # def find_fixed_point_iterative(self, x_star_init, radius, max_iters=10, 
+    #                                min_pairs=20, tol=1e-6, verbose=True):
+    #     """
+    #     Iteratively find the fixed point (saddle node) using a fixed neighborhood radius.
+        
+    #     Parameters:
+    #     -----------
+    #     x_star_init : array-like
+    #         Initial guess for the fixed point
+    #     radius : float
+    #         Fixed radius for the neighborhood around the fixed point
+    #     max_iters : int
+    #         Maximum number of iterations
+    #     min_pairs : int
+    #         Minimum number of pairs required for estimation
+    #     tol : float
+    #         Convergence tolerance (change in fixed point estimate)
+    #     verbose : bool
+    #         Print iteration details
+            
+    #     Returns:
+    #     --------
+    #     x_star : array
+    #         Estimated fixed point
+    #     A_local : array
+    #         Local linear approximation matrix A
+    #     b_local : array
+    #         Local linear approximation offset b
+    #     history : dict
+    #         Dictionary containing iteration history
+    #     """
+    #     x_star = np.asarray(x_star_init).ravel().copy()
+    #     history = {
+    #         'x_star': [x_star.copy()],
+    #         'A': [],
+    #         'b': [],
+    #         'n_pairs': [],
+    #         'residual_norm': []
+    #     }
+        
+    #     for iteration in range(max_iters):
+    #         # Crop pairs to those within the fixed radius of current x_star
+    #         local_pairs = []
+    #         for x_prev, x_curr in self.pairs:
+    #             # Include pair if x_prev is within radius of x_star
+    #             if np.linalg.norm(x_prev - x_star) <= radius:
+    #                 local_pairs.append((x_prev, x_curr))
+            
+    #         n_local = len(local_pairs)
+            
+    #         if n_local < min_pairs:
+    #             if verbose:
+    #                 print(f"Iteration {iteration}: Only {n_local} pairs found (< {min_pairs}). Stopping.")
+    #             break
+            
+    #         # Compute local VAR parameters
+    #         X_p = np.vstack([p[0] for p in local_pairs])
+    #         X_f = np.vstack([p[1] for p in local_pairs])
+            
+    #         mean_p = X_p.mean(axis=0)
+    #         mean_f = X_f.mean(axis=0)
+            
+    #         X_p0 = X_p - mean_p
+    #         X_f0 = X_f - mean_f
+    #         C_pp = X_p0.T @ X_p0
+    #         C_fp = X_f0.T @ X_p0
+            
+    #         A_local = C_fp @ np.linalg.pinv(C_pp)
+    #         b_local = mean_f - A_local @ mean_p
+            
+    #         # Update fixed point estimate: solve (I - A) x_star = b
+    #         # x_star = (I - A)^{-1} b
+    #         I_minus_A = np.eye(self.dim) - A_local
+    #         try:
+    #             x_star_new = np.linalg.solve(I_minus_A, b_local)
+    #         except np.linalg.LinAlgError:
+    #             if verbose:
+    #                 print(f"Iteration {iteration}: Singular matrix (I - A). Using pseudoinverse.")
+    #             x_star_new = np.linalg.pinv(I_minus_A) @ b_local
+            
+    #         # Compute residual
+    #         pred = X_p @ A_local.T + b_local
+    #         residuals = X_f - pred
+    #         residual_norm = np.sqrt(np.mean(np.sum(residuals**2, axis=1)))
+            
+    #         # Store history
+    #         history['x_star'].append(x_star_new.copy())
+    #         history['A'].append(A_local.copy())
+    #         history['b'].append(b_local.copy())
+    #         history['n_pairs'].append(n_local)
+    #         history['residual_norm'].append(residual_norm)
+            
+    #         # Check convergence
+    #         delta = np.linalg.norm(x_star_new - x_star)
+            
+    #         if verbose:
+    #             print(f"Iteration {iteration}: n_pairs={n_local}, "
+    #                   f"delta={delta:.6e}, residual={residual_norm:.6e}, "
+    #                   f"x_star={x_star_new}")
+            
+    #         if delta < tol:
+    #             if verbose:
+    #                 print(f"Converged at iteration {iteration}!")
+    #             x_star = x_star_new
+    #             break
+            
+    #         x_star = x_star_new
+        
+    #     return x_star, A_local, b_local, history
 
 
 
