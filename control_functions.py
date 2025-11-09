@@ -1,6 +1,344 @@
 import numpy as np
 from typing import Callable, Tuple, Optional, Literal
 
+def relu_control_1d(u, lambda_u):
+    """1D ReLU control along unstable coordinate."""
+    signal = 2 * lambda_u * u
+    return -np.maximum(signal, 0.0)
+
+
+def relu_scalar(u_scalar, l_unstable, D):
+    # ReLU control in scalar form
+    return 2 * D * np.maximum(0, u_scalar) * l_unstable
+
+
+def relu_feedback(x, l_unstable, lambda_u, D, x_fp=None, r_neigh=1.0, nbhd_shape="rectangular"):
+    if x_fp is None:
+        x_fp = np.zeros_like(x)
+
+    if not in_neighborhood(x, x_fp, l_unstable, r_neigh, nbhd_shape):
+        return np.zeros_like(x)
+
+    proj = np.dot(l_unstable, x - x_fp)
+    signal = 2 * lambda_u * proj
+    #print(f"x: {x}, lambda_u: {lambda_u}, Projection: {proj}, Control: {np.maximum(signal, 0.0) * l_unstable}")
+    return - np.maximum(signal, 0.0) * l_unstable
+
+
+def committor_1d(u_vals, a, r):
+    """
+    Compute committor q(u) for 1D OU unstable coordinate for an array of u values.
+    """
+    def q_single(u):
+        num, _ = quad(lambda y: np.exp(-0.5 * r * y**2), -a, u)
+        den, _ = quad(lambda y: np.exp(-0.5 * r * y**2), -a, a)
+        return num / den
+    
+    return np.array([q_single(u) for u in u_vals])
+
+def committor_control_quad(tracker, x, r=1.0, x_fp=None, a=1.0, D=1.0):
+    """
+    Optimal committor control for stochastic dynamics near saddle.
+
+    Parameters
+    ----------
+    tracker : ExponentialCovarianceTracker
+        Holds l_unstable (unit vector) and lambda_t (unstable eigenvalue).
+    x : np.ndarray
+        Current state.
+    r : float
+        Radius of neighborhood around fixed point where control is active.
+    x_fp : np.ndarray or None
+        Fixed point estimate. If None, assume origin.
+    a : float
+        Absorbing boundary threshold in unstable coordinate.
+    D : float
+        Diffusion coefficient (inverse temperature).
+    """
+    if x_fp is None:
+        x_fp = np.zeros_like(x)
+
+    # Distance to fixed point
+    dist = np.linalg.norm(x - x_fp)
+    if dist > r:
+        return np.zeros_like(x)
+
+    l_u = tracker.l_unstable
+    lambda_u = tracker.lambda_t
+
+    # Projection onto unstable coordinate
+    u = np.dot(l_u, x - x_fp)
+
+    # Parameter r = lambda_u / (2D)
+    rho = lambda_u / (2*D)
+
+    # Committor function and derivative ratio
+    q_u = committor_1d(u, a, rho)
+    # q'(u) = exp(-0.5*r*u^2) / ∫_{-a}^a exp(-0.5*r*y^2) dy
+    den, _ = quad(lambda y: np.exp(-0.5 * rho * y**2), -a, a)
+    q_prime = np.exp(-0.5 * rho * u**2) / den
+
+    # Optimal committor control
+    control_scalar = 2 * D * (q_prime / max(q_u, 1e-12))  # avoid div by zero
+    control = control_scalar * l_u
+
+    return control
+
+def committor_control_quad_1d(u, a: float, lambda_u: float, D: float):
+    """
+    Vectorized 1D quadrature-based committor control along unstable mode.
+
+    Parameters
+    ----------
+    u : float or np.ndarray
+        Projection onto unstable coordinate.
+    a : float
+        Absorbing boundary threshold.
+    lambda_u : float
+        Unstable eigenvalue.
+    D : float
+        Diffusion coefficient.
+
+    Returns
+    -------
+    control : float or np.ndarray
+        Optimal committor control 2D q'/q along the unstable coordinate.
+    """
+    # Parameter rho = lambda_u / (2 D)
+    rho = lambda_u / (2 * D)
+
+    # Compute normalization denominator once (scalar)
+    den, _ = quad(lambda y: np.exp(-0.5 * rho * y**2), -a, a)
+
+    # Ensure u is array-like
+    u_arr = np.atleast_1d(u)
+
+    # Committor q(u) via integral
+    q_u = np.array([quad(lambda y: np.exp(-0.5 * rho * y**2), -a, ui)[0] / den for ui in u_arr])
+
+    # Derivative q'(u)
+    q_prime = np.exp(-0.5 * rho * u_arr**2) / den
+
+    # Optimal control: 2 D q'/q, safe division
+    control = np.where(q_u > 1e-12, 4 * D * q_prime / q_u, 0.0)
+
+    # Return scalar if input was scalar
+    if np.isscalar(u):
+        return control[0]
+    return control
+
+
+from scipy import special
+def make_committor_and_control_from_projection(lambda_u: float, D: float, a: float):
+    r = lambda_u / (2 * D)
+    sqrt_r = np.sqrt(r)
+    Z = special.erf(a * sqrt_r) - special.erf(-a * sqrt_r)
+
+    def committor_function(p: float) -> float:
+        return (special.erf(p * sqrt_r) - special.erf(-a * sqrt_r)) / Z
+
+    def committor_control(p: float) -> float:
+        q_val = committor_function(p)
+        if q_val < 1e-8:
+            return 0.0  # Avoid division by zero
+        dq_dp = (2 / np.sqrt(np.pi)) * sqrt_r * np.exp(-r * p**2) / Z
+        return 2 * D * dq_dp / q_val
+    
+    def committor_control(p: float) -> float:
+        return 2 * D * np.exp(-r * p**2) / (special.erf(p * sqrt_r) - special.erf(-a * sqrt_r))
+
+    return committor_function, committor_control
+
+def committor_control_erf(p, lambda_u: float, D: float, a: float):
+    """
+    Vectorized committor control using erf formulation (simplified).
+
+    Parameters
+    ----------
+    p : float or np.ndarray
+        Projection onto unstable coordinate.
+    lambda_u : float
+        Unstable eigenvalue.
+    D : float
+        Diffusion constant.
+    a : float
+        Absorbing boundary threshold.
+
+    Returns
+    -------
+    control : float or np.ndarray
+        Optimal committor control.
+    """
+    r = lambda_u / (2 * D)
+    sqrt_r = np.sqrt(r)
+
+    denom = special.erf(p * sqrt_r) - special.erf(-a * sqrt_r)
+
+    # Safe division (avoid division by zero or tiny denom)
+    control = np.where(
+        np.abs(denom) > 1e-12,
+        (4 * D * sqrt_r / np.sqrt(np.pi)) * np.exp(-r * p**2) / denom,
+        0.0,
+    )
+    return control
+
+
+def committor_control_erf_scalar(p: float, lambda_u: float, D: float, a: float) -> float:
+    r = lambda_u / (2 * D)
+    sqrt_r = np.sqrt(r)
+    denom = special.erf(p * sqrt_r) - special.erf(-a * sqrt_r)
+    if denom < 1e-12:  # avoid div by zero
+        return 0.0
+    return (4 * D * sqrt_r / np.sqrt(np.pi)) * np.exp(-r * p**2) / denom
+
+
+
+import mpmath   #for high precision calculations
+mpmath.mp.dps = 200  # decimal places
+def high_precision_control(xs: np.ndarray, a: float, r: float, D: float, precision: int = 50) -> np.ndarray:
+    """
+    Compute high-precision control values using mpmath for integration and exponentiation.
+    
+    Parameters:
+        xs : np.ndarray
+            Points at which to evaluate the control.
+        a : float
+            Integration limit (-a to x).
+        r : float
+            Rate parameter in the exponential.
+        D : float
+            Scaling constant.
+        precision : int
+            Decimal precision for mpmath.
+
+    Returns:
+        np.ndarray of control values, dtype float64, filled with np.nan where integral is too small.
+    """
+    mpmath.mp.dps = precision
+    a_mpf = mpmath.mpf(a)
+    r_mpf = mpmath.mpf(r)
+    D_mpf = mpmath.mpf(D)
+
+    control_exact = np.zeros_like(xs, dtype=np.float64)
+
+    for i, x in tqdm(enumerate(xs)):
+        x_mpf = mpmath.mpf(x)
+
+        # Define the integrand
+        integrand = lambda y: mpmath.exp(-r_mpf * y**2)
+
+        # High-precision definite integral
+        try:
+            integral_val = mpmath.quad(integrand, [-a_mpf, x_mpf])
+        except Exception:
+            integral_val = mpmath.mpf(0)
+
+        numerator = 2 * D_mpf * mpmath.exp(-r_mpf * x_mpf**2)
+        control_exact[i] = float(numerator / (integral_val + mpmath.mpf('1e-500')))
+        # if mpmath.fabs(integral_val) > mpmath.mpf('1e-1000'):
+        #     numerator = 2 * D_mpf * mpmath.exp(-r_mpf * x_mpf**2)
+        #     control_exact[i] = float(numerator / integral_val)
+        # else:
+        #     control_exact[i] = np.nan
+
+    return control_exact
+
+
+def high_precision_control_scalar(x: float, a: float, r: float, D: float, precision: int = 50) -> float:
+    """
+    Compute high-precision control value for a single scalar using mpmath.
+
+    Parameters
+    ----------
+    x : float
+        Point at which to evaluate the control.
+    a : float
+        Integration limit (-a to x).
+    r : float
+        Rate parameter in the exponential.
+    D : float
+        Scaling constant.
+    precision : int
+        Decimal precision for mpmath.
+
+    Returns
+    -------
+    float
+        Control value. Returns np.nan if integral is too small.
+    """
+    mpmath.mp.dps = precision
+    a_mpf = mpmath.mpf(a)
+    r_mpf = mpmath.mpf(r)
+    D_mpf = mpmath.mpf(D)
+    x_mpf = mpmath.mpf(x)
+
+    # Define the integrand
+    integrand = lambda y: mpmath.exp(-r_mpf * y**2)
+
+    # High-precision definite integral
+    try:
+        integral_val = mpmath.quad(integrand, [-a_mpf, x_mpf])
+    except Exception:
+        integral_val = mpmath.mpf(0)
+
+    # Compute control with tiny offset to avoid division by zero
+    control_val = float(2 * D_mpf * mpmath.exp(-r_mpf * x_mpf**2) / (integral_val + mpmath.mpf('1e-1500')))
+
+    return control_val
+
+
+def in_neighborhood(x, x_fp, l_unstable, r_neigh, nbhd_shape="rectangular"):
+    """
+    Check whether x is inside the neighborhood around x_fp.
+    
+    Args:
+        x : np.ndarray
+        x_fp : fixed point (np.ndarray)
+        l_unstable : unstable direction (np.ndarray)
+        r_neigh : float, radius or bound
+        nbhd_shape : "circular" or "rectangular"
+    """
+    if nbhd_shape == "circular":
+        dist = np.linalg.norm(x - x_fp)
+        return dist <= r_neigh
+
+    elif nbhd_shape == "rectangular":  # committor-based
+        u_scalar = np.dot(l_unstable, x - x_fp)
+        return abs(u_scalar) <= r_neigh
+
+    else:
+        raise ValueError(f"Unknown nbhd_shape: {nbhd_shape}")
+    
+def erf_feedback(x, l_unstable, lambda_u, D, a, 
+                x_fp=None, r_neigh=1.0, nbhd_shape="rectangular"):
+    if np.allclose(D, 0):
+        D = 1e-8  # avoid div by zero
+    if x_fp is None:
+        x_fp = np.zeros_like(x)
+
+    if not in_neighborhood(x, x_fp, l_unstable, r_neigh, nbhd_shape):
+        return np.zeros_like(x)
+
+    u_scalar = -np.dot(l_unstable, x - x_fp)
+    r = lambda_u / (2 * D)
+
+    return -committor_control_erf_scalar(u_scalar, lambda_u=lambda_u, D=D, a=a) * l_unstable
+
+def high_precision_feedback(x, l_unstable, lambda_u, D, a, 
+                            x_fp=None, r_neigh=1.0, nbhd_shape="rectangular"):
+    if x_fp is None:
+        x_fp = np.zeros_like(x)
+
+    if not in_neighborhood(x, x_fp, l_unstable, r_neigh, nbhd_shape):
+        return np.zeros_like(x)
+
+    u_scalar = -np.dot(l_unstable, x - x_fp)
+    r = lambda_u / (2 * D)
+
+    return -high_precision_control_scalar(u_scalar, a=a, r=r, D=D, precision=25) * l_unstable
+
+
+
 class LS_Controller:
     def __init__(
         self,
