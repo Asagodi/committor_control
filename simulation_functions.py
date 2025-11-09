@@ -1,6 +1,84 @@
 import numpy as np
 from typing import Callable, Tuple, Optional, Literal
 
+
+
+def D_to_noise_std(D):
+    """
+    Convert diffusion coefficient D to per-step noise_std used in Euler-Maruyama.
+
+    Parameters:
+        D (float): Diffusion coefficient in the SDE (dX = f dt + sqrt(2D) dW)
+
+    Returns:
+        noise_std (float): Standard deviation to use in X[t] = X[t-1] + f*dt + noise_std*sqrt(dt)*randn()
+    """
+    return np.sqrt(2 * D)
+
+
+def noise_std_to_D(noise_std, dim=2):
+    """
+    Convert per-step noise_std back to diffusion coefficient D.
+
+    Parameters:
+        noise_std (float): Standard deviation used in Euler-Maruyama step
+
+    Returns:
+        D (float): Diffusion coefficient in the SDE
+    """
+    return noise_std**2 / dim
+
+
+def noise_strength_to_D(noise_strength, dt, dim=1, sde_convention="sqrt2D"):
+    """
+    Convert tracker noise_strength to diffusion coefficient D.
+
+    Parameters
+    ----------
+    noise_strength : float
+        Exponential moving average of squared noise increments (⟨et^2⟩).
+    dt : float
+        Simulation time step.
+    dim : int, default=1
+        Dimension of the system (length of et).
+    sde_convention : str, default="sqrt2D"
+        - "sqrt2D": et ~ sqrt(2 D dt) * xi  (standard SDE definition)
+        - "sqrtD":  et ~ sqrt(D dt) * xi    (common simulation convention without factor 2)
+
+    Returns
+    -------
+    D : float
+        Estimated per-component diffusion coefficient.
+    """
+    if sde_convention == "sqrt2D":
+        return noise_strength / (2 * dt * dim)
+    elif sde_convention == "sqrtD":
+        return noise_strength / (dt * dim)
+    else:
+        raise ValueError("sde_convention must be 'sqrt2D' or 'sqrtD'")
+
+
+# def generate_initial_positions(n_traj, dim, seed=0):
+#     np.random.seed(seed)
+#     return [np.random.uniform(-0.5, 0.5, size=(dim,)) for _ in range(n_traj)]
+
+def generate_noise(initial_positions, T, dim, noise_std, dt, seed=0):
+    np.random.seed(seed)
+    all_noise = []
+    for _ in initial_positions:
+        noise = np.random.randn(T, dim) * noise_std * np.sqrt(dt)
+        all_noise.append(noise)
+    return all_noise
+
+def simulate_trajectory(x0, T, dim, dt, drift_func, noise, control_func=None):
+    X = np.zeros((T, dim))
+    X[0] = x0
+    for t in range(1, T):
+        dx = drift_func(t, X[t-1])
+        u_t = control_func(X[t-1]) if control_func is not None else np.zeros(dim)
+        X[t] = X[t-1] + dx*dt + u_t*dt + noise[t]
+    return X
+
 def generate_initial_conditions(
     n: int,
     bound: float,
