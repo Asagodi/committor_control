@@ -7,7 +7,7 @@ This repository contains the simulation code for evaluating committor-based reac
 Control is often most valuable precisely where autonomous dynamics are most fragile, such as neighborhoods of saddle equilibria where small perturbations redirect trajectories toward qualitatively different futures. This codebase evaluates:
 
 1. **Model-based Optimal Control:** A deterministic, one-sided linear (ReLU-like) law derived from the forward committor limit.
-2. **Data-enabled Control (Static):** An open-loop controller that identifies the unstable mode, growth rate, and diffusion from an initial observation period using Whitened SVD.
+2. **Data-enabled Control:** An open-loop controller that identifies the unstable mode, growth rate, and diffusion from an initial observation period using Whitened SVD.
 3. **Closed-loop Adaptive Control:** An online estimator that continually refines parameters using temporal differencing to bypass unknown fixed-point offsets while control is actively applied.
 
 ### Evaluated Dynamical Systems
