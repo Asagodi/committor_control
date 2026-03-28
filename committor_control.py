@@ -731,8 +731,58 @@ def plot_convergence_from_data(csv_filepath, sys_lambda_true=2.0, sys_D_true=0.0
     plt.close(fig)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6c. Noise sweep & energy sweep
+# 6c. Sweep & Scaling Helpers 
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _plot_energy_panel(ax, data_en, noises, methods_in_data, pseudo_zero, map_x, label_fontsize, legend_fontsize, energy_ylim=None, energy_yticks=None):
+    """Shared helper to plot the Mean Energy panel with SEM shading."""
+    c_opt = PLOT_CONFIG["COLORS"].get("Optimal"); c_cca = PLOT_CONFIG["COLORS"].get("CCA"); c_adapt = PLOT_CONFIG["COLORS"].get("CCA (Adaptive)")
+    lbl_map = {'Optimal': 'Model-based', 'CCA': 'Data-enabled', 'CCA (Adaptive)': 'Closed-loop'}
+    color_map = {'Optimal': c_opt, 'CCA': c_cca, 'CCA (Adaptive)': c_adapt}
+    ls_map = {'Optimal': '-', 'CCA': '--', 'CCA (Adaptive)': '-.'}
+    marker_map = {'Optimal': 's', 'CCA': 'o', 'CCA (Adaptive)': 'd'}
+
+    for method in methods_in_data:
+        xs_zero, ys_zero, sem_zero = [], [], []
+        xs_pos, ys_pos, sem_pos = [], [], []
+        for n in noises:
+            if method == "Optimal" and n == 0.0: continue
+            row = next((r for r in data_en if r['Noise_D'] == n and r['Method'] == method), None)
+            if row:
+                sem = row['Std_Energy'] / np.sqrt(max(row['N_Success'], 1)) if row.get('N_Success', 0) > 0 else 0.0
+                if n == 0.0:
+                    xs_zero.append(map_x(n)); ys_zero.append(row['Mean_Energy']); sem_zero.append(sem)
+                else:
+                    xs_pos.append(map_x(n)); ys_pos.append(row['Mean_Energy']); sem_pos.append(sem)
+
+        col = color_map.get(method, "#000"); ls = ls_map.get(method, "-"); lbl = lbl_map.get(method, method); mrk = marker_map.get(method, "s")
+        
+        if xs_zero: ax.plot(xs_zero, ys_zero, marker=mrk, color=col, ls='none', lw=1.5, markersize=5, label=lbl if not xs_pos else "")
+        if xs_pos: ax.plot(xs_pos, ys_pos, marker=mrk, color=col, ls=ls, lw=1.5, markersize=5, label=lbl)
+
+        ys_pos, sem_pos = np.array(ys_pos), np.array(sem_pos)
+        ys_zero, sem_zero = np.array(ys_zero), np.array(sem_zero)
+
+        if len(xs_pos) > 0 and np.any(sem_pos > 0):
+            ax.fill_between(xs_pos, ys_pos - 1.96*sem_pos, ys_pos + 1.96*sem_pos, color=col, alpha=0.15)
+        if len(xs_zero) > 0 and np.any(sem_zero > 0):
+            ax.fill_between(xs_zero, ys_zero - 1.96*sem_zero, ys_zero + 1.96*sem_zero, color=col, alpha=0.15)
+
+    all_en = [d['Mean_Energy'] for d in data_en if d['Method'] in methods_in_data and d['Mean_Energy'] > 0]
+    if energy_ylim: ax.set_ylim(energy_ylim)
+    elif all_en: ax.set_ylim(min(all_en)*0.8, max(all_en)*1.2)
+    
+    if energy_yticks: ax.set_yticks(energy_yticks)
+    if pseudo_zero > 0: ax.axvline(x=pseudo_zero * 1.5, color='gray', linestyle=':', alpha=0.5)
+
+    ax.set_ylabel("Mean control energy", fontsize=label_fontsize)
+    ax.set_xscale('log')
+    if noises:
+        ax.set_xticks([map_x(n) for n in noises])
+        ax.set_xticklabels(['0' if n == 0.0 else f"{n:.3g}" for n in noises], rotation=45, ha='right')
+    ax.set_xlabel("Noise strength ($D$)", fontsize=label_fontsize)
+    ax.legend(loc='upper left', fontsize=legend_fontsize)
+
 
 def plot_noise_sweep(csv_filepath="figures/dimensionality_scaling_stats.csv", plot_grid=False, log_x=True, fontsize=10):
     set_ieee_style()
@@ -834,47 +884,42 @@ def simulate_and_save_noise_energy_sweep(sys, a=0.5, dt=0.01, r_neigh=np.inf, nu
 def plot_noise_energy_sweep_data(csv_filepath="figures/noise_energy_sweep.csv", sys_name=None, filepath="figures/noise_energy_sweep.pdf", fontsize=10):
     set_ieee_style()
     if not os.path.exists(csv_filepath): return
+    
     data = []
     with open(csv_filepath, 'r') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            data.append({'System': row['System'], 'Method': row['Method'], 'Noise_D': float(row['Noise_D']),
-                         'Success_Rate': float(row['Success_Rate']), 'Mean_Energy': float(row['Mean_Energy'])})
+            entry = {'System': row['System'], 'Method': row['Method'], 'Noise_D': float(row['Noise_D']),
+                     'Success_Rate': float(row['Success_Rate']), 'Mean_Energy': float(row['Mean_Energy'])}
+            if 'Std_Energy' in row and 'N_Success' in row:
+                entry['Std_Energy'] = float(row['Std_Energy'])
+                entry['N_Success'] = int(row['N_Success'])
+            else:
+                entry['Std_Energy'] = 0.0
+                entry['N_Success'] = 0
+            data.append(entry)
+            
     if sys_name and any(d['System'] == sys_name for d in data):
         data = [d for d in data if d['System'] == sys_name]
+        
+    if not data: return
+
     noises = sorted(list(set(d['Noise_D'] for d in data)))
     methods_in_data = ["Optimal", "CCA", "CCA (Adaptive)"]
     non_zero_noises = [n for n in noises if n > 0]
     pseudo_zero = min(non_zero_noises) / 3.0 if non_zero_noises else 0.0001
     def map_x(n): return pseudo_zero if n == 0.0 else n
-    c_opt = PLOT_CONFIG["COLORS"].get("Optimal"); c_cca = PLOT_CONFIG["COLORS"].get("CCA"); c_adapt = PLOT_CONFIG["COLORS"].get("CCA (Adaptive)")
-    lbl_map = {'Optimal': 'Model-based', 'CCA': 'Data-enabled', 'CCA (Adaptive)': 'Closed-loop'}
-    color_map = {'Optimal': c_opt, 'CCA': c_cca, 'CCA (Adaptive)': c_adapt}
-    ls_map = {'Optimal': '-', 'CCA': '--', 'CCA (Adaptive)': '-.'}
+
     fig, ax = plt.subplots(1, 1, figsize=(4.5, 3.5))
-    for method in methods_in_data:
-        xs_zero, ys_zero, xs_pos, ys_pos = [], [], [], []
-        for n in noises:
-            if method == "Optimal" and n == 0.0: continue
-            row_data = next((r for r in data if r['Noise_D'] == n and r['Method'] == method), None)
-            if row_data is not None:
-                val = row_data['Mean_Energy']
-                if n == 0.0: xs_zero.append(map_x(n)); ys_zero.append(val)
-                else: xs_pos.append(map_x(n)); ys_pos.append(val)
-        col = color_map.get(method, "#000"); ls = ls_map.get(method, "-"); lbl = lbl_map.get(method, method)
-        if xs_zero: ax.plot(xs_zero, ys_zero, marker='s', color=col, ls='none', lw=1.5, markersize=4, label=lbl if not xs_pos else "")
-        if xs_pos: ax.plot(xs_pos, ys_pos, marker='s', color=col, ls=ls, lw=1.5, markersize=4, label=lbl)
-    ax.set_xscale('log'); ax.set_xticks([map_x(n) for n in noises])
-    ax.set_xticklabels(['0' if n == 0.0 else f"{n:.3g}" for n in noises], rotation=45, ha='right')
-    all_energies = [d['Mean_Energy'] for d in data if d['Method'] in methods_in_data]
-    y_max = np.ceil(max(all_energies)) if all_energies else 2.0
-    y_min = np.floor(min(all_energies)) if all_energies else 0.0
-    ax.set_ylim(y_min, y_max); ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-    ax.axvline(x=pseudo_zero * 1.5, color='gray', linestyle=':', alpha=0.5)
-    ax.set_xlabel("Noise strength ($D$)"); ax.set_ylabel("Mean control energy"); ax.legend(loc='upper left')
+    _plot_energy_panel(ax, data, noises, methods_in_data, pseudo_zero, map_x, 
+                       label_fontsize=fontsize, legend_fontsize=fontsize-1)
+
+    ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
     fig.tight_layout()
-    fig.savefig(filepath, bbox_inches="tight"); fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight")
-    plt.close(fig); print(f"Saved energy sweep plot -> {filepath}")
+    fig.savefig(filepath, bbox_inches="tight")
+    fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved energy sweep plot -> {filepath}")
 
 def plot_noise_energy_sweep_single_sys(sys, a=0.5, dt=0.01, r_neigh=np.inf, num_trajs=100, T_sim=2000, T_train=2500, tau=10, use_whitened=True, noise_levels=None, filepath="figures/noise_energy_sweep.pdf"):
     csv_path = filepath.replace(".pdf", ".csv")
@@ -892,86 +937,64 @@ def plot_success_and_energy_vs_noise(csv_filepath, sys_name, filepath, layout="s
             if row['System'] == sys_name:
                 entry = {'Method': row['Method'], 'Noise_D': float(row['Noise_D']),
                          'Success_Rate': float(row['Success_Rate']), 'Mean_Energy': float(row['Mean_Energy'])}
-                # Handle both old (no std) and new CSV formats
                 if 'Std_Energy' in row and 'N_Success' in row:
-                    entry['Std_Energy'] = float(row['Std_Energy'])
-                    entry['N_Success'] = int(row['N_Success'])
+                    entry['Std_Energy'] = float(row['Std_Energy']); entry['N_Success'] = int(row['N_Success'])
                 else:
-                    entry['Std_Energy'] = 0.0
-                    entry['N_Success'] = 0
+                    entry['Std_Energy'] = 0.0; entry['N_Success'] = 0
                 data.append(entry)
+                
     if not data: print(f"     [ERROR] No data for {sys_name}"); return
+    
     noises = sorted(set(d['Noise_D'] for d in data))
     non_zero_noises = [n for n in noises if n > 0]
     pseudo_zero = min(non_zero_noises) / 3.0 if non_zero_noises else 0.0001
     def map_x(n): return pseudo_zero if n == 0.0 else n
+    
     methods = ["Optimal", "CCA"]
     if include_adaptive: methods.append("CCA (Adaptive)")
     color_map = {'Optimal': PLOT_CONFIG["COLORS"]["Optimal"], 'CCA': PLOT_CONFIG["COLORS"]["CCA"], 'CCA (Adaptive)': PLOT_CONFIG["COLORS"]["CCA (Adaptive)"]}
     lbl_map = {'Optimal': 'Model-based', 'CCA': 'Data-enabled', 'CCA (Adaptive)': 'Closed-loop'}
-    all_energies = [d['Mean_Energy'] for d in data if d['Method'] in methods and d['Mean_Energy'] > 0]
-    y_min_en = min(all_energies) * 0.8 if all_energies else 0.0
-    y_max_en = max(all_energies) * 1.2 if all_energies else 2.0
+    
     if layout == "stacked":
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(5.0, 5.5), sharex=True); fig.subplots_adjust(hspace=0.1)
         for method in methods:
-            xs_zero, ys1_zero, ys2_zero, sem_zero = [], [], [], []
-            xs_pos, ys1_pos, ys2_pos, sem_pos = [], [], [], []
+            xs_zero, ys1_zero = [], []
+            xs_pos, ys1_pos = [], []
             for n in noises:
                 row = next((r for r in data if r['Noise_D'] == n and r['Method'] == method), None)
                 if row:
-                    sem = row['Std_Energy'] / np.sqrt(max(row['N_Success'], 1)) if row['N_Success'] > 0 else 0.0
-                    if n == 0.0:
-                        xs_zero.append(map_x(n)); ys1_zero.append(row['Success_Rate'])
-                        ys2_zero.append(row['Mean_Energy']); sem_zero.append(sem)
-                    else:
-                        xs_pos.append(map_x(n)); ys1_pos.append(row['Success_Rate'])
-                        ys2_pos.append(row['Mean_Energy']); sem_pos.append(sem)
+                    if n == 0.0: xs_zero.append(map_x(n)); ys1_zero.append(row['Success_Rate'])
+                    else: xs_pos.append(map_x(n)); ys1_pos.append(row['Success_Rate'])
+            
             col = color_map.get(method, "#000"); lbl = lbl_map.get(method, method)
-            # Panel 1: Success Rate
             if xs_zero: ax1.plot(xs_zero, ys1_zero, marker='o', color=col, ls='none', lw=1.5, markersize=5)
             if xs_pos: ax1.plot(xs_pos, ys1_pos, marker='o', color=col, ls='-', lw=1.5, markersize=5, label=lbl)
             elif xs_zero: ax1.plot([], [], marker='o', color=col, ls='-', lw=1.5, markersize=5, label=lbl)
-            # Panel 2: Mean Energy with SEM shading
-            ys2_zero, ys2_pos = np.array(ys2_zero), np.array(ys2_pos)
-            sem_zero, sem_pos = np.array(sem_zero), np.array(sem_pos)
-            if len(xs_zero) > 0:
-                ax2.plot(xs_zero, ys2_zero, marker='s', color=col, ls='none', lw=1.5, markersize=5)
-                ax2.fill_between(xs_zero, ys2_zero - 1.96*sem_zero, ys2_zero + 1.96*sem_zero, color=col, alpha=0.15)
-            if len(xs_pos) > 0:
-                ax2.plot(xs_pos, ys2_pos, marker='s', color=col, ls='--', lw=1.5, markersize=5)
-                ax2.fill_between(xs_pos, ys2_pos - 1.96*sem_pos, ys2_pos + 1.96*sem_pos, color=col, alpha=0.15)
+            
         ax1.set_ylim(-0.05, 1.05); ax1.set_ylabel("Success rate", fontsize=label_fontsize)
         ax1.legend(loc='lower left', fontsize=legend_fontsize)
-        ax2.set_ylim(y_min_en, y_max_en); ax2.set_ylabel("Mean control energy", fontsize=label_fontsize)
-        ax2.set_xscale('log'); ax2.set_xticks([map_x(n) for n in noises])
-        ax2.set_xticklabels(['0' if n == 0.0 else f"{n:.3g}" for n in noises], rotation=45, ha='right')
-        ax2.set_xlabel("Noise strength ($D$)", fontsize=label_fontsize)
-        if non_zero_noises:
-            ax1.axvline(x=pseudo_zero * 1.5, color='gray', linestyle=':', alpha=0.5)
-            ax2.axvline(x=pseudo_zero * 1.5, color='gray', linestyle=':', alpha=0.5)
+        if non_zero_noises: ax1.axvline(x=pseudo_zero * 1.5, color='gray', linestyle=':', alpha=0.5)
+
+        _plot_energy_panel(ax2, data, noises, methods, pseudo_zero, map_x, label_fontsize, legend_fontsize)
         fig.align_ylabels([ax1, ax2])
+        
     fig.savefig(filepath, bbox_inches="tight"); fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight")
     print(f"     Saved {layout} success/energy plot -> {filepath}"); plt.close(fig)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 6d. Combined scaling + energy plot
-# ──────────────────────────────────────────────────────────────────────────────
 
 def plot_scaling_and_energy(dim_csv_filepath, energy_csv_filepath, filepath="figures/combined_scaling_energy.pdf",
-                            include_adaptive=False, line_alpha=0.8,
-                            success_ylim=(0.45, 1.05), success_yticks=(0.5, 1.0),
-                            energy_ylim=None, energy_yticks=None,
-                            legend_fontsize=12, label_fontsize=12, title_fontsize=13):
+                            include_adaptive=False, line_alpha=0.8, success_ylim=(0.45, 1.05), success_yticks=(0.5, 1.0),
+                            energy_ylim=None, energy_yticks=None, legend_fontsize=12, label_fontsize=12, title_fontsize=13):
     set_ieee_style()
     fig, (ax_scale, ax_energy) = plt.subplots(2, 1, figsize=(6, 6.5), sharex=True)
     fig.subplots_adjust(hspace=0.1)
     print(f"  -> Plotting stacked combined figure...")
-    # --- PANEL A: DIMENSIONALITY SCALING ---
-    noises = []
-    non_zero_noises = []
+    
+    noises, non_zero_noises = [], []
     pseudo_zero = 0.0001
     def map_x(n): return pseudo_zero if n == 0.0 else n
+
+    # --- PANEL A: DIMENSIONALITY SCALING ---
     if os.path.exists(dim_csv_filepath):
         data_dim = []; methods_scale = ["CCA"]
         if include_adaptive: methods_scale.append("CCA (Adaptive)")
@@ -988,7 +1011,7 @@ def plot_scaling_and_energy(dim_csv_filepath, energy_csv_filepath, filepath="fig
             noises = sorted(list(set(d['Noise_D'] for d in data_dim)))
             non_zero_noises = [n for n in noises if n > 0]
             pseudo_zero = min(non_zero_noises) / 2.0 if non_zero_noises else 0.0001
-            def map_x(n): return pseudo_zero if n == 0.0 else n
+            
             palettes = {
                 lams[0]: [plt.cm.Purples(x) for x in np.linspace(0.85, 0.4, len(dims))],
                 lams[1]: [plt.cm.Oranges(x) for x in np.linspace(0.85, 0.4, len(dims))]
@@ -1009,9 +1032,11 @@ def plot_scaling_and_energy(dim_csv_filepath, energy_csv_filepath, filepath="fig
                         col = colors[j]; mrk = dim_markers[j % len(dim_markers)]
                         if xs_zero: ax_scale.plot(xs_zero, ys_zero, marker=mrk, markersize=5, color=col, ls='none', alpha=alpha_val)
                         if xs_pos: ax_scale.plot(xs_pos, ys_pos, marker=mrk, markersize=5, color=col, ls=ls_val, lw=1.5, alpha=alpha_val)
+                        
             ax_scale.set_ylim(success_ylim); ax_scale.set_yticks(success_yticks)
             if non_zero_noises: ax_scale.axvline(x=pseudo_zero * 1.5, color='gray', linestyle=':', alpha=0.5)
             ax_scale.set_ylabel("Success rate", fontsize=label_fontsize)
+            
             legend_elements = [Line2D([0], [0], color='none', label=r'$\lambda_u$')]
             for lam in lams:
                 mid_color = palettes[lam][len(dims)//2]
@@ -1026,8 +1051,8 @@ def plot_scaling_and_energy(dim_csv_filepath, energy_csv_filepath, filepath="fig
                 legend_elements.append(Line2D([0], [0], color='gray', ls='-', lw=1.5, label=' Static'))
                 legend_elements.append(Line2D([0], [0], color='gray', ls='--', lw=1.5, label=' Adapt'))
             ax_scale.legend(handles=legend_elements, loc="lower left", fontsize=legend_fontsize, ncol=3 if include_adaptive else 2, framealpha=0.95)
-    else:
-        print(f"     [ERROR] Could not find Dimensionality CSV at: {dim_csv_filepath}")
+    else: print(f"     [ERROR] Could not find Dimensionality CSV at: {dim_csv_filepath}")
+
     # --- PANEL B: ENERGY SWEEP ---
     if os.path.exists(energy_csv_filepath):
         data_en = []
@@ -1040,54 +1065,19 @@ def plot_scaling_and_energy(dim_csv_filepath, energy_csv_filepath, filepath="fig
                 else:
                     entry['Std_Energy'] = 0.0; entry['N_Success'] = 0
                 data_en.append(entry)
+                
         if data_en:
             methods_in_data = ["Optimal", "CCA"]
             if include_adaptive: methods_in_data.append("CCA (Adaptive)")
-            c_opt = PLOT_CONFIG["COLORS"].get("Optimal"); c_cca = PLOT_CONFIG["COLORS"].get("CCA"); c_adapt = PLOT_CONFIG["COLORS"].get("CCA (Adaptive)")
-            if include_adaptive:
-                lbl_map = {'Optimal': 'Model-based', 'CCA': 'Data-enabled', 'CCA (Adaptive)': 'Closed-loop'}
-            else:
-                lbl_map = {'Optimal': 'Model-based', 'CCA': 'Data-enabled'}
-            color_map = {'Optimal': c_opt, 'CCA': c_cca, 'CCA (Adaptive)': c_adapt}
-            ls_map = {'Optimal': '-', 'CCA': '--', 'CCA (Adaptive)': '-.'}
-            marker_map = {'Optimal': 's', 'CCA': 'o', 'CCA (Adaptive)': 'd'}
+            
             if not noises:
                 noises = sorted(list(set(d['Noise_D'] for d in data_en)))
                 non_zero_noises = [n for n in noises if n > 0]
                 pseudo_zero = min(non_zero_noises) / 2.0 if non_zero_noises else 0.0001
-            for method in methods_in_data:
-                xs_zero, ys_zero, sem_zero = [], [], []
-                xs_pos, ys_pos, sem_pos = [], [], []
-                for n in noises:
-                    if method == "Optimal" and n == 0.0: continue
-                    row = next((r for r in data_en if r['Noise_D'] == n and r['Method'] == method), None)
-                    if row:
-                        sem = row['Std_Energy'] / np.sqrt(max(row['N_Success'], 1)) if row['N_Success'] > 0 else 0.0
-                        if n == 0.0: xs_zero.append(map_x(n)); ys_zero.append(row['Mean_Energy']); sem_zero.append(sem)
-                        else: xs_pos.append(map_x(n)); ys_pos.append(row['Mean_Energy']); sem_pos.append(sem)
-                col = color_map.get(method, "#000"); ls = ls_map.get(method, "-"); lbl = lbl_map.get(method, method); mrk = marker_map.get(method, "s")
-                if xs_zero: ax_energy.plot(xs_zero, ys_zero, marker=mrk, color=col, ls='none', lw=1.5, markersize=5, label=lbl if not xs_pos else "")
-                if xs_pos: ax_energy.plot(xs_pos, ys_pos, marker=mrk, color=col, ls=ls, lw=1.5, markersize=5, label=lbl)
-                ys_pos, sem_pos = np.array(ys_pos), np.array(sem_pos)
-                ys_zero, sem_zero = np.array(ys_zero), np.array(sem_zero)
-                if len(xs_pos) > 0 and np.any(sem_pos > 0):
-                    ax_energy.fill_between(xs_pos, ys_pos - 1.96*sem_pos, ys_pos + 1.96*sem_pos, color=col, alpha=0.15)
-                if len(xs_zero) > 0 and np.any(sem_zero > 0):
-                    ax_energy.fill_between(xs_zero, ys_zero - 1.96*sem_zero, ys_zero + 1.96*sem_zero, color=col, alpha=0.15)
-            all_en = [d['Mean_Energy'] for d in data_en if d['Method'] in methods_in_data and d['Mean_Energy'] > 0]
-            if energy_ylim: ax_energy.set_ylim(energy_ylim)
-            elif all_en: ax_energy.set_ylim(min(all_en)*0.8, max(all_en)*1.2)
-            if energy_yticks: ax_energy.set_yticks(energy_yticks)
-            if non_zero_noises: ax_energy.axvline(x=pseudo_zero * 1.5, color='gray', linestyle=':', alpha=0.5)
-            ax_energy.set_ylabel("Mean control energy", fontsize=label_fontsize)
-            ax_energy.legend(loc='upper left', fontsize=legend_fontsize)
-    else:
-        print(f"     [ERROR] Could not find Energy CSV at: {energy_csv_filepath}")
-    ax_energy.set_xscale('log')
-    if noises:
-        ax_energy.set_xticks([map_x(n) for n in noises])
-        ax_energy.set_xticklabels(['0' if n == 0.0 else f"{n:.3g}" for n in noises], rotation=45, ha='right', fontsize=label_fontsize)
-    ax_energy.set_xlabel("Noise strength ($D$)", fontsize=label_fontsize)
+                
+            _plot_energy_panel(ax_energy, data_en, noises, methods_in_data, pseudo_zero, map_x, label_fontsize, legend_fontsize, energy_ylim, energy_yticks)
+    else: print(f"     [ERROR] Could not find Energy CSV at: {energy_csv_filepath}")
+
     ax_scale.tick_params(axis='y', labelsize=label_fontsize); ax_energy.tick_params(axis='y', labelsize=label_fontsize)
     fig.align_ylabels([ax_scale, ax_energy])
     fig.savefig(filepath, bbox_inches="tight"); fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight")
@@ -1164,7 +1154,7 @@ def run_evaluation_suite(sys, B_restrictive=None, a=0.5, r_neigh=np.inf, D_eval=
     alg_online = OnlineCCATracker(dim=sys.x_star.size, dt=dt, gamma=0.01, tau=tau, min_steps=20, a=a, rng_seed=0, use_whitened=use_whitened)
     alg_online.train(sys.drift, T_budget, dt, D_train, 0, sys.w_u_true, sys.x_star, r_neigh=r_neigh)
     p_online = alg_online.get_params(sys.w_u_true)
-    print(f"  True:           lambda_u={sys.lambda_u_true:.3f}, w_u={sys.w_u_true}")
+    print(f"  True:             lambda_u={sys.lambda_u_true:.3f}, w_u={sys.w_u_true}")
     if "CCA (Algo 1)" in methods_to_run: print(f"  CCA (Algo 1):   lambda_u={p_algo1['lambda_u']:.3f}, D={p_algo1['D']:.5f}, w_u={p_algo1['w_u']}")
     if "CCA (Whitened)" in methods_to_run: print(f"  CCA (Whitened): lambda_u={p_whitened['lambda_u']:.3f}, D={p_whitened['D']:.5f}, w_u={p_whitened['w_u']}")
     if "CCA (Adaptive)" in methods_to_run: print(f"  CCA (Adaptive): lambda_u={p_online['lambda_u']:.3f}, D={p_online['D']:.5f}, w_u={p_online['w_u']}")
@@ -1222,7 +1212,6 @@ def run_dimensionality_scaling_experiment(dt=0.01, num_trajs=1000, T_sim=5000, u
     print(f" Dimensionality Scaling Experiment | Mode: {mode_str}")
     print("="*80)
     
-    # Simplified trust region to match boundary
     a = 0.5
     r_neigh = a
     
@@ -1245,7 +1234,6 @@ def run_dimensionality_scaling_experiment(dt=0.01, num_trajs=1000, T_sim=5000, u
                     else: c_opt = partial(erf_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
                     opt_results = [simulate_trajectory(x0, T_sim, dt, sys.drift, D_test, c_opt, sys, a, np.random.default_rng())[1] for x0 in ics]
                     
-                    # Fix: Include timeouts as success when D=0
                     hits_opt = sum(1 for hs in opt_results if hs == "reached_A" or (D_test < 1e-8 and hs == "timeout"))
                     time_opt = sum(1 for hs in opt_results if hs == "timeout")
                     fail_opt = sum(1 for hs in opt_results if hs == "hit_B")
@@ -1258,14 +1246,12 @@ def run_dimensionality_scaling_experiment(dt=0.01, num_trajs=1000, T_sim=5000, u
                     
                     cca_results = [simulate_adaptive_trajectory(x0, T_sim, dt, sys.drift, D_test, copy.deepcopy(alg), sys, a, r_neigh, None, np.random.default_rng(), is_adaptive=False)[1] for x0 in ics]
                     
-                    # Fix: Include timeouts as success when D=0
                     hits_cca = sum(1 for hs in cca_results if hs == "reached_A" or (D_test < 1e-8 and hs == "timeout"))
                     time_cca = sum(1 for hs in cca_results if hs == "timeout")
                     fail_cca = sum(1 for hs in cca_results if hs == "hit_B")
                     
                     cca_adapt_results = [simulate_adaptive_trajectory(x0, T_sim, dt, sys.drift, D_test, copy.deepcopy(alg_online), sys, a, r_neigh, None, np.random.default_rng(), is_adaptive=True)[1] for x0 in ics]
                     
-                    # Fix: Include timeouts as success when D=0
                     hits_adapt = sum(1 for hs in cca_adapt_results if hs == "reached_A" or (D_test < 1e-8 and hs == "timeout"))
                     time_adapt = sum(1 for hs in cca_adapt_results if hs == "timeout")
                     fail_adapt = sum(1 for hs in cca_adapt_results if hs == "hit_B")
@@ -1276,6 +1262,7 @@ def run_dimensionality_scaling_experiment(dt=0.01, num_trajs=1000, T_sim=5000, u
                     print(f"  Dim {dim:2}, lam_u {lam_u:3}, D {D_test:5.3f} | Opt [A: {hits_opt/num_trajs:.2f}] | CCA [A: {hits_cca/num_trajs:.2f}] | Adapt [A: {hits_adapt/num_trajs:.2f}]")
     print(f"Saved -> {filepath}")
     plot_noise_sweep(filepath, plot_grid=False, log_x=True)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN EXECUTION SCRIPT
@@ -1299,7 +1286,6 @@ if __name__ == "__main__":
 
     # ══════════════════════════════════════════════════════════════════════
     # FIGURE 1: Single trajectory examples (all 3 systems)
-    #   Autonomous / Data-enabled (open-loop) / Closed-loop (adaptive)
     # ══════════════════════════════════════════════════════════════════════
     print("\n" + "#"*80 + "\n FIGURE 1: Trajectory examples\n" + "#"*80)
     traj_methods = ["Autonomous", "CCA (Whitened)", "CCA (Adaptive)"]
@@ -1311,10 +1297,6 @@ if __name__ == "__main__":
 
     # ══════════════════════════════════════════════════════════════════════
     # FIGURE 2: Linear system diagnostics
-    #   2a. Parameter convergence
-    #   2b. Noise sweep (success + energy vs D)
-    #   2c. Dimensionality & lambda scaling
-    #   2d. Combined scaling + energy
     # ══════════════════════════════════════════════════════════════════════
     print("\n" + "#"*80 + "\n FIGURE 2: Linear diagnostics\n" + "#"*80)
     sys, a, r_neigh, tau, D_eval = systems["linear_2d"]
