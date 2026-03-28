@@ -730,6 +730,7 @@ def plot_convergence_from_data(csv_filepath, sys_lambda_true=2.0, sys_D_true=0.0
     print(f"     Saved {layout} convergence plot -> {filepath}")
     plt.close(fig)
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 6c. Sweep & Scaling Helpers 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1286,6 +1287,7 @@ if __name__ == "__main__":
 
     # ══════════════════════════════════════════════════════════════════════
     # FIGURE 1: Single trajectory examples (all 3 systems)
+    #   Autonomous / Data-enabled (open-loop) / Closed-loop (adaptive)
     # ══════════════════════════════════════════════════════════════════════
     print("\n" + "#"*80 + "\n FIGURE 1: Trajectory examples\n" + "#"*80)
     traj_methods = ["Autonomous", "CCA (Whitened)", "CCA (Adaptive)"]
@@ -1297,6 +1299,10 @@ if __name__ == "__main__":
 
     # ══════════════════════════════════════════════════════════════════════
     # FIGURE 2: Linear system diagnostics
+    #   2a. Parameter convergence (stacked and combined)
+    #   2b. Noise sweep (success + energy vs D)
+    #   2c. Dimensionality & lambda scaling
+    #   2d. Combined scaling + energy
     # ══════════════════════════════════════════════════════════════════════
     print("\n" + "#"*80 + "\n FIGURE 2: Linear diagnostics\n" + "#"*80)
     sys, a, r_neigh, tau, D_eval = systems["linear_2d"]
@@ -1307,8 +1313,11 @@ if __name__ == "__main__":
                               r_neigh=r_neigh, num_trajs=num_trajs, tau=tau,
                               use_whitened=use_whitened, csv_filepath=conv_csv)
     plot_convergence_from_data(csv_filepath=conv_csv, sys_lambda_true=sys.lambda_u_true,
-                               sys_D_true=D_eval, filepath="figures/linear_2d_convergence.pdf",
+                               sys_D_true=D_eval, filepath="figures/linear_2d_convergence_stacked.pdf",
                                layout="stacked", label_fontsize=13, tick_fontsize=12, legend_fontsize=10)
+    plot_convergence_from_data(csv_filepath=conv_csv, sys_lambda_true=sys.lambda_u_true,
+                               sys_D_true=D_eval, filepath="figures/linear_2d_convergence_combined.pdf",
+                               layout="combined", label_fontsize=13, tick_fontsize=12, legend_fontsize=10)
 
     # 2b. Noise sweep (D)
     energy_csv = "figures/linear_2d_noise_sweep.csv"
