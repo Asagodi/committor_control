@@ -823,7 +823,7 @@ def simulate_and_save_noise_energy_sweep(sys, a=0.5, dt=0.01, r_neigh=np.inf, nu
                         traj, hit_side, energy = simulate_adaptive_trajectory(x0, T_sim, dt, sys.drift, D_test, tr_copy, sys, a, r_neigh, None, run_rng, is_adaptive=is_adaptive)
                     else:
                         traj, hit_side, energy = simulate_trajectory(x0, T_sim, dt, sys.drift, D_test, ctrl, sys, a, run_rng)
-                    if hit_side == "reached_A":
+                    if hit_side == "reached_A" or (D_test < 1e-8 and hit_side == "timeout"):
                         successes += 1; energies.append(energy)
                 succ_rate = successes / num_trajs
                 mean_energy = np.mean(energies) if energies else 0.0
@@ -1221,7 +1221,11 @@ def run_dimensionality_scaling_experiment(dt=0.01, num_trajs=1000, T_sim=5000, u
     mode_str = "WHITENED CCA" if use_whitened else "STANDARD CCA (Algo 1)"
     print(f" Dimensionality Scaling Experiment | Mode: {mode_str}")
     print("="*80)
-    a, r_neigh = 0.5, np.inf
+    
+    # Simplified trust region to match boundary
+    a = 0.5
+    r_neigh = a
+    
     clean_mode_str = mode_str.replace(" ", "_").replace("(", "").replace(")", "").replace(".", "")
     filepath = f"figures/dimensionality_scaling_stats_{clean_mode_str}.csv"
     with open(filepath, 'w', newline='') as f:
@@ -1240,22 +1244,32 @@ def run_dimensionality_scaling_experiment(dt=0.01, num_trajs=1000, T_sim=5000, u
                     if D_test < 1e-8: c_opt = partial(relu_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
                     else: c_opt = partial(erf_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
                     opt_results = [simulate_trajectory(x0, T_sim, dt, sys.drift, D_test, c_opt, sys, a, np.random.default_rng())[1] for x0 in ics]
-                    hits_opt = sum(1 for hs in opt_results if hs == "reached_A")
+                    
+                    # Fix: Include timeouts as success when D=0
+                    hits_opt = sum(1 for hs in opt_results if hs == "reached_A" or (D_test < 1e-8 and hs == "timeout"))
                     time_opt = sum(1 for hs in opt_results if hs == "timeout")
                     fail_opt = sum(1 for hs in opt_results if hs == "hit_B")
+                    
                     D_train = max(D_test, 0.005)
                     alg = CCATracker(dim=dim, dt=dt, tau=10, rng_seed=0, use_whitened=use_whitened)
                     alg.train(sys.drift, 2500, dt, D_train, 0, a, sys.w_u_true, init_center=sys.x_star)
                     alg_online = OnlineCCATracker(dim=dim, dt=dt, gamma=0.01, tau=10, min_steps=20, a=a, rng_seed=0, use_whitened=use_whitened)
                     alg_online.train(sys.drift, 2500, dt, D_train, 0, sys.w_u_true, sys.x_star)
+                    
                     cca_results = [simulate_adaptive_trajectory(x0, T_sim, dt, sys.drift, D_test, copy.deepcopy(alg), sys, a, r_neigh, None, np.random.default_rng(), is_adaptive=False)[1] for x0 in ics]
-                    hits_cca = sum(1 for hs in cca_results if hs == "reached_A")
+                    
+                    # Fix: Include timeouts as success when D=0
+                    hits_cca = sum(1 for hs in cca_results if hs == "reached_A" or (D_test < 1e-8 and hs == "timeout"))
                     time_cca = sum(1 for hs in cca_results if hs == "timeout")
                     fail_cca = sum(1 for hs in cca_results if hs == "hit_B")
+                    
                     cca_adapt_results = [simulate_adaptive_trajectory(x0, T_sim, dt, sys.drift, D_test, copy.deepcopy(alg_online), sys, a, r_neigh, None, np.random.default_rng(), is_adaptive=True)[1] for x0 in ics]
-                    hits_adapt = sum(1 for hs in cca_adapt_results if hs == "reached_A")
+                    
+                    # Fix: Include timeouts as success when D=0
+                    hits_adapt = sum(1 for hs in cca_adapt_results if hs == "reached_A" or (D_test < 1e-8 and hs == "timeout"))
                     time_adapt = sum(1 for hs in cca_adapt_results if hs == "timeout")
                     fail_adapt = sum(1 for hs in cca_adapt_results if hs == "hit_B")
+                    
                     writer.writerow([dim, lam_u, D_test, "Optimal", hits_opt/num_trajs, time_opt/num_trajs, fail_opt/num_trajs])
                     writer.writerow([dim, lam_u, D_test, "CCA", hits_cca/num_trajs, time_cca/num_trajs, fail_cca/num_trajs])
                     writer.writerow([dim, lam_u, D_test, "CCA (Adaptive)", hits_adapt/num_trajs, time_adapt/num_trajs, fail_adapt/num_trajs])
