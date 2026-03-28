@@ -2,7 +2,7 @@
 committor_control.py
 ======================
 Committor-based optimal control for stochastic saddle-point systems.
-Evaluates static and adaptive (closed-loop) CCA tracking procedures.
+Evaluates static and adaptive (closed-loop) tracking procedures.
 """
 
 import os
