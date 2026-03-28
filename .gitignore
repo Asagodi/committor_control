@@ -1,0 +1,11 @@
+figures/
+
+v1/
+
+posters/
+
+notes_and_papers/
+
+__pycache__/
+
+*.pdf
