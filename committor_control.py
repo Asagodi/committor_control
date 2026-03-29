@@ -121,6 +121,29 @@ def _sym_inv_sqrt(mat, reg=1e-6):
     vals = np.maximum(vals, floor)
     return vecs @ np.diag(1.0 / np.sqrt(vals)) @ vecs.T
 
+def generate_initial_conditions(sys, a, num_trajs, seed=11, u_min_frac=0.02, u_max_frac=0.5, s_spread_frac=0.5):
+    """
+    Standardized initial condition generator for all experiments.
+    Scales perfectly with the safety boundary 'a'.
+    """
+    w_u_norm = sys.w_u_true / np.linalg.norm(sys.w_u_true)
+    
+    # Generate a consistent orthogonal stable direction
+    w_s = np.random.default_rng(42).standard_normal(sys.x_star.size)
+    w_s -= np.dot(w_s, w_u_norm) * w_u_norm
+    w_s /= np.linalg.norm(w_s) + 1e-15
+    
+    rng_ic = np.random.default_rng(seed)
+    
+    # Sample dynamically based on fractions of the boundary 'a'
+    ics = [
+        sys.x_star 
+        + rng_ic.uniform(a * u_min_frac, a * u_max_frac) * w_u_norm 
+        + rng_ic.uniform(-a * s_spread_frac, a * s_spread_frac) * w_s 
+        for _ in range(num_trajs)
+    ]
+    return ics, rng_ic
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 2. Controllers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -927,7 +950,7 @@ def simulate_and_save_noise_energy_sweep(sys, a=0.5, dt=0.01, r_neigh=np.inf, nu
             if D_test < 1e-8: c_opt = partial(relu_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
             else: c_opt = partial(erf_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
             rng_ic = np.random.default_rng(11)
-            ics = [sys.x_star + rng_ic.uniform(0.02, a * 0.9) * w_u_norm + rng_ic.uniform(-a * 0.4, a * 0.4) * w_s for _ in range(num_trajs)]
+            ics, rng_ic = generate_initial_conditions(sys, a, num_trajs)
             methods_config = [
                 ('Optimal', c_opt, False, False, None),
                 ('CCA', None, True, False, tracker),
@@ -1203,7 +1226,7 @@ def run_evaluation_suite(sys, B_restrictive=None, a=0.5, r_neigh=np.inf, D_eval=
     w_s = np.random.default_rng(42).standard_normal(sys.x_star.size)
     w_s -= np.dot(w_s, w_u_norm) * w_u_norm; w_s /= np.linalg.norm(w_s) + 1e-15
     rng_ic = np.random.default_rng(seed)
-    ics = [sys.x_star + rng_ic.uniform(0.02, a*0.9)*w_u_norm + rng_ic.uniform(-a*spread_s, a*spread_s)*w_s for _ in range(num_trajs)]
+    ics, rng_ic = generate_initial_conditions(sys, a, num_trajs, seed=seed, s_spread_frac=spread_s)
     
     single_trajs, multi_trajs = [], []
     for raw_name, display_label, ctrl, col, est_dir, tracker, is_adaptive in methods:
@@ -1261,8 +1284,7 @@ def run_dimensionality_scaling_experiment(dt=0.01, num_trajs=1000, T_sim=5000, u
                 w_s -= np.dot(w_s, w_u_norm) * w_u_norm; w_s /= np.linalg.norm(w_s)+1e-15
                 
                 for D_test in noise_levels:
-                    rng_ic = np.random.default_rng(11)
-                    ics = [sys.x_star + rng_ic.uniform(0.02, a*0.9)*w_u_norm + rng_ic.uniform(-a*0.4, a*0.4)*w_s for _ in range(num_trajs)]
+                    ics, rng_ic = generate_initial_conditions(sys, a, num_trajs)
                     kw = dict(a=a, r_neigh=r_neigh)
                     
                     if D_test < 1e-8: c_opt = partial(relu_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
@@ -1350,8 +1372,7 @@ def run_baseline_comparison(sys, a=0.5, r_neigh=np.inf, dt=0.01, num_trajs=100, 
             c_cca_relu = partial(relu_feedback, w_u=p_wsvd['w_u'], lambda_u=p_wsvd['lambda_u'], D=p_wsvd['D'], x_fp=p_wsvd['x_star'], **kw)
 
             # --- Generate Initial Conditions ---
-            rng_ic = np.random.default_rng(11)
-            ics = [sys.x_star + rng_ic.uniform(0.02, a * 0.9) * w_u_norm + rng_ic.uniform(-a * 0.4, a * 0.4) * w_s for _ in range(num_trajs)]
+            ics, rng_ic = generate_initial_conditions(sys, a, num_trajs)
 
             # Compare apples to apples
             methods_config = [
@@ -1498,7 +1519,7 @@ def plot_baseline_comparison(csv_filepath="figures/baselines.csv", filepath="fig
 
 
 
-def run_gating_weighting_ablation(sys, a=0.5, dt=0.01, D_eval=0.01, num_trajs=100, T_sim=2000, T_train=2500, csv_filepath="figures/ablation_gating_weighting.csv"):
+def run_gating_weighting_ablation(sys, a=0.5, r_neigh=np.inf, dt=0.01, D_eval=0.01, num_trajs=100, T_sim=2000, T_train=2500, csv_filepath="figures/ablation_gating_weighting.csv"):
     """
     Isolates the practical weakness of discrete-time tracking bias far from the saddle.
     Compares:
@@ -1510,19 +1531,14 @@ def run_gating_weighting_ablation(sys, a=0.5, dt=0.01, D_eval=0.01, num_trajs=10
     print(f"\n -> Running Gating & Weighting Ablation for {sys.name} at D={D_eval}...")
     os.makedirs(os.path.dirname(csv_filepath), exist_ok=True)
     
-    w_u_norm = sys.w_u_true / np.linalg.norm(sys.w_u_true)
-    w_s = np.random.default_rng(42).standard_normal(sys.x_star.size)
-    w_s -= np.dot(w_s, w_u_norm) * w_u_norm
-    w_s /= np.linalg.norm(w_s) + 1e-15
-    rng_ic = np.random.default_rng(11)
-    
-    # BUG FIX 1: Ensure initial conditions start INSIDE the coordinate gating box (max 0.8a and 0.4a)
-    ics = [sys.x_star + rng_ic.uniform(0.1, a * 0.8) * w_u_norm + rng_ic.uniform(-a * 0.4, a * 0.4) * w_s for _ in range(num_trajs)]
+    # Use the standardized IC generator with safe bounds to prevent sudden death
+    ics, rng_ic = generate_initial_conditions(sys, a, num_trajs, seed=11, u_min_frac=0.02, u_max_frac=0.5, s_spread_frac=0.5)
 
     conditions = [
         {"name": "No Gating", "type": "none", "xu": np.inf, "xs": np.inf, "sigma": np.inf},
-        {"name": "Coordinate Gating", "type": "coordinate", "xu": a * 0.9, "xs": a * 0.5, "sigma": np.inf},
-        {"name": "Weighted Estimation", "type": "weighting", "xu": np.inf, "xs": np.inf, "sigma": 0.3}
+        # Widen the gating bounds so ICs don't instantly trip the learning cutoff.
+        {"name": "Coordinate Gating", "type": "coordinate", "xu": a * 0.98, "xs": a * 1.5, "sigma": np.inf},
+        {"name": "Weighted Estimation", "type": "weighting", "xu": np.inf, "xs": np.inf, "sigma": 0.4}
     ]
 
     with open(csv_filepath, 'w', newline='') as f:
@@ -1533,8 +1549,8 @@ def run_gating_weighting_ablation(sys, a=0.5, dt=0.01, D_eval=0.01, num_trajs=10
             base_gamma = 0.01
             tracker = OnlineCCATracker(dim=sys.x_star.size, dt=dt, gamma=base_gamma, tau=10, min_steps=20, a=a, rng_seed=0, use_whitened=True)
             
-            # BUG FIX 2: Pre-train locally (r_neigh=a) so nonlinear systems don't poison the initial estimate
-            tracker.train(sys.drift, T_train, dt, D_eval, 0, sys.w_u_true, sys.x_star, r_neigh=a)
+            # Pre-train locally passing the specific r_neigh for the system
+            tracker.train(sys.drift, T_train, dt, D_eval, 0, sys.w_u_true, sys.x_star, r_neigh=r_neigh)
             
             successes, timeouts, failures, energies, lambda_estimates = 0, 0, 0, [], []
             
@@ -1552,7 +1568,22 @@ def run_gating_weighting_ablation(sys, a=0.5, dt=0.01, D_eval=0.01, num_trajs=10
                     
                     params = tr_copy.get_params(sign_ref=sys.w_u_true)
                     
-                    # 1. Check Coordinate Gating
+                    # 1. ALWAYS COMPUTE CONTROL (Never turn off the engines on an unstable saddle!)
+                    if D_eval < 1e-8:
+                        u_ideal = relu_feedback(x, params['w_u'], params['lambda_u'], D_eval, params['x_star'], a, np.inf)
+                    else:
+                        u_ideal = erf_feedback(x, params['w_u'], params['lambda_u'], params['D'], params['x_star'], a, np.inf)
+
+                    u_applied = np.clip(u_ideal, -50.0, 50.0)
+                    energy += np.sum(u_applied**2) * dt
+                    
+                    # 2. Environment Step
+                    drift_val = sys.drift(t * dt, x)
+                    noise_val = np.sqrt(2.0 * D_eval) * run_rng.standard_normal(len(x)) * np.sqrt(dt) if D_eval > 0 else 0.0
+                    x_next = x + (drift_val + u_applied) * dt + noise_val
+                    x_next_pseudo = x_next - u_applied * dt
+                    
+                    # 3. Check Trust Region for LEARNING ONLY
                     in_trust_region = True
                     if cond["type"] == "coordinate":
                         dx = x - params['x_star']
@@ -1560,26 +1591,7 @@ def run_gating_weighting_ablation(sys, a=0.5, dt=0.01, D_eval=0.01, num_trajs=10
                         x_s_mag = np.linalg.norm(dx - float(np.dot(params['w_u'], dx)) * params['w_u'])
                         in_trust_region = (x_u_mag <= cond["xu"]) and (x_s_mag <= cond["xs"])
 
-                    # 2. Compute Control (cut if gated)
-                    if in_trust_region:
-                        if D_eval < 1e-8:
-                            u_ideal = relu_feedback(x, params['w_u'], params['lambda_u'], D_eval, params['x_star'], a, np.inf)
-                        else:
-                            u_ideal = erf_feedback(x, params['w_u'], params['lambda_u'], params['D'], params['x_star'], a, np.inf)
-                    else:
-                        u_ideal = np.zeros_like(x)
-                        tr_copy.reset()
-
-                    u_applied = np.clip(u_ideal, -50.0, 50.0)
-                    energy += np.sum(u_applied**2) * dt
-                    
-                    # 3. Environment Step
-                    drift_val = sys.drift(t * dt, x)
-                    noise_val = np.sqrt(2.0 * D_eval) * run_rng.standard_normal(len(x)) * np.sqrt(dt) if D_eval > 0 else 0.0
-                    x_next = x + (drift_val + u_applied) * dt + noise_val
-                    x_next_pseudo = x_next - u_applied * dt
-                    
-                    # 4. Tracker Update & Weighting
+                    # 4. Tracker Update (Gate the data, not the physics)
                     if in_trust_region:
                         if cond["type"] == "weighting":
                             dist_sq = np.sum((x - params['x_star'])**2)
@@ -1589,6 +1601,9 @@ def run_gating_weighting_ablation(sys, a=0.5, dt=0.01, D_eval=0.01, num_trajs=10
                             tr_copy.gamma = base_gamma
                             
                         tr_copy.update(x, x_next_pseudo, sys.w_u_true)
+                    else:
+                        if cond["type"] == "coordinate":
+                            tr_copy.reset() # Flush short-term memory so it doesn't get poisoned
                         
                     x = x_next
                 
@@ -1610,13 +1625,12 @@ def run_gating_weighting_ablation(sys, a=0.5, dt=0.01, D_eval=0.01, num_trajs=10
             writer.writerow([sys.name, cond["name"], succ_rate, to_rate, fail_rate, mean_energy, mean_lambda])
             print(f"  {cond['name']:<20} | SR={succ_rate:.2f} | Fail={fail_rate:.2f} | E={mean_energy:.3f} | Lam_u_est={mean_lambda:.3f} (True={sys.lambda_u_true:.3f})")
 
-
+            
 def run_hyperparameter_ablation(sys, a=0.5, dt=0.01, D_eval=0.01, num_trajs=100, T_sim=2000, T_train=2500, csv_filepath="figures/ablation_hyperparameters.csv"):
     """
-    Evaluates robustness to the central hyperparameters in Algorithm 1:
-    Lag (\tau) and EMA discount (\gamma).
+    Evaluates robustness to the central hyperparameters in Algorithm 1 using a FULL GRID search.
     """
-    print(f"\n -> Running Hyperparameter Ablation (Tau and Gamma) for {sys.name}...")
+    print(f"\n -> Running Full Grid Hyperparameter Ablation for {sys.name}...")
     os.makedirs(os.path.dirname(csv_filepath), exist_ok=True)
     
     w_u_norm = sys.w_u_true / np.linalg.norm(sys.w_u_true)
@@ -1625,10 +1639,8 @@ def run_hyperparameter_ablation(sys, a=0.5, dt=0.01, D_eval=0.01, num_trajs=100,
     w_s /= np.linalg.norm(w_s) + 1e-15
     rng_ic = np.random.default_rng(11)
     
-    # Safe ICs to avoid early boundary clipping
-    ics = [sys.x_star + rng_ic.uniform(0.02, a * 0.8) * w_u_norm + rng_ic.uniform(-a * 0.4, a * 0.4) * w_s for _ in range(num_trajs)]
+    ics, rng_ic = generate_initial_conditions(sys, a, num_trajs)
 
-    # Test a grid of values
     tau_list = [1, 5, 10, 20]
     gamma_list = [0.001, 0.01, 0.05, 0.1]
 
@@ -1636,48 +1648,25 @@ def run_hyperparameter_ablation(sys, a=0.5, dt=0.01, D_eval=0.01, num_trajs=100,
         writer = csv.writer(f)
         writer.writerow(["System", "Tau", "Gamma", "Success_Rate", "Fail_Rate", "Mean_Energy"])
         
-        # 1. Sweep Tau (fixing Gamma = 0.01)
+        # FULL GRID SWEEP
         for tau in tau_list:
-            tracker = OnlineCCATracker(dim=sys.x_star.size, dt=dt, gamma=0.01, tau=tau, min_steps=20, a=a, rng_seed=0, use_whitened=True)
-            
-            # BUG FIX 2: Pre-train locally (r_neigh=a)
-            tracker.train(sys.drift, T_train, dt, D_eval, 0, sys.w_u_true, sys.x_star, r_neigh=a)
-            
-            successes, failures, energies = 0, 0, []
-            for x0 in ics:
-                run_rng = np.random.default_rng(int(rng_ic.integers(0, 10**6)))
-                tr_copy = copy.deepcopy(tracker)
-                traj, hit_side, energy = simulate_adaptive_trajectory(x0, T_sim, dt, sys.drift, D_eval, tr_copy, sys, a, np.inf, None, run_rng, is_adaptive=True)
+            for gamma in gamma_list:
+                tracker = OnlineCCATracker(dim=sys.x_star.size, dt=dt, gamma=gamma, tau=tau, min_steps=20, a=a, rng_seed=0, use_whitened=True)
+                tracker.train(sys.drift, T_train, dt, D_eval, 0, sys.w_u_true, sys.x_star, r_neigh=a)
                 
-                if hit_side == "hit_B": failures += 1
-                if hit_side == "reached_A" or (D_eval < 1e-8 and hit_side == "timeout"):
-                    successes += 1; energies.append(energy)
-            
-            sr, fr, me = successes/num_trajs, failures/num_trajs, np.mean(energies) if energies else 0.0
-            writer.writerow([sys.name, tau, 0.01, sr, fr, me])
-            print(f"  Tau={tau:<3} | Gamma=0.01  | SR={sr:.2f} | Fail={fr:.2f} | E={me:.3f}")
-
-        # 2. Sweep Gamma (fixing Tau = 10)
-        for gamma in gamma_list:
-            if gamma == 0.01: continue # Already tested above
-            tracker = OnlineCCATracker(dim=sys.x_star.size, dt=dt, gamma=gamma, tau=10, min_steps=20, a=a, rng_seed=0, use_whitened=True)
-            
-            # BUG FIX 2: Pre-train locally (r_neigh=a)
-            tracker.train(sys.drift, T_train, dt, D_eval, 0, sys.w_u_true, sys.x_star, r_neigh=a)
-            
-            successes, failures, energies = 0, 0, []
-            for x0 in ics:
-                run_rng = np.random.default_rng(int(rng_ic.integers(0, 10**6)))
-                tr_copy = copy.deepcopy(tracker)
-                traj, hit_side, energy = simulate_adaptive_trajectory(x0, T_sim, dt, sys.drift, D_eval, tr_copy, sys, a, np.inf, None, run_rng, is_adaptive=True)
+                successes, failures, energies = 0, 0, []
+                for x0 in ics:
+                    run_rng = np.random.default_rng(int(rng_ic.integers(0, 10**6)))
+                    tr_copy = copy.deepcopy(tracker)
+                    traj, hit_side, energy = simulate_adaptive_trajectory(x0, T_sim, dt, sys.drift, D_eval, tr_copy, sys, a, np.inf, None, run_rng, is_adaptive=True)
+                    
+                    if hit_side == "hit_B": failures += 1
+                    if hit_side == "reached_A" or (D_eval < 1e-8 and hit_side == "timeout"):
+                        successes += 1; energies.append(energy)
                 
-                if hit_side == "hit_B": failures += 1
-                if hit_side == "reached_A" or (D_eval < 1e-8 and hit_side == "timeout"):
-                    successes += 1; energies.append(energy)
-            
-            sr, fr, me = successes/num_trajs, failures/num_trajs, np.mean(energies) if energies else 0.0
-            writer.writerow([sys.name, 10, gamma, sr, fr, me])
-            print(f"  Tau=10  | Gamma={gamma:<5} | SR={sr:.2f} | Fail={fr:.2f} | E={me:.3f}")
+                sr, fr, me = successes/num_trajs, failures/num_trajs, np.mean(energies) if energies else 0.0
+                writer.writerow([sys.name, tau, gamma, sr, fr, me])
+                print(f"  Tau={tau:<3} | Gamma={gamma:<5} | SR={sr:.2f} | Fail={fr:.2f} | E={me:.3f}")
 
 
 def plot_gating_weighting_ablation(csv_filepath, true_lambda=2.0, filepath="figures/ablation_fixes.pdf"):
@@ -1721,61 +1710,36 @@ def plot_gating_weighting_ablation(csv_filepath, true_lambda=2.0, filepath="figu
     print(f"  Saved Gating/Weighting Ablation Plot -> {filepath}")
 
 def plot_hyperparameter_ablation(csv_filepath, filepath="figures/ablation_hyperparameters.pdf"):
-    """Plots the Success Rate robustness against Tau and Gamma."""
+    """Plots the Success Rate as a 2D Heatmap over Tau and Gamma."""
+    import seaborn as sns
+    import pandas as pd
     set_ieee_style()
     if not os.path.exists(csv_filepath): return
     
-    tau_vals, tau_sr = [], []
-    gamma_vals, gamma_sr = [], []
+    # Load data into pandas for easy pivoting
+    df = pd.read_csv(csv_filepath)
     
-    with open(csv_filepath, 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            t = float(row['Tau'])
-            g = float(row['Gamma'])
-            sr = float(row['Success_Rate'])
-            
-            # Extract the Tau sweep (where Gamma was fixed at 0.01)
-            if abs(g - 0.01) < 1e-5:
-                tau_vals.append(t)
-                tau_sr.append(sr)
-                
-            # Extract the Gamma sweep (where Tau was fixed at 10)
-            if abs(t - 10.0) < 1e-5:
-                # To prevent duplicating the intersection point in the arrays if logged twice
-                if g not in gamma_vals: 
-                    gamma_vals.append(g)
-                    gamma_sr.append(sr)
-
-    # Sort just in case CSV wrote out of order
-    tau_vals, tau_sr = zip(*sorted(zip(tau_vals, tau_sr)))
-    gamma_vals, gamma_sr = zip(*sorted(zip(gamma_vals, gamma_sr)))
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.0, 3.5), sharey=True)
+    # Create a pivot table: Rows = Tau, Cols = Gamma, Values = Success Rate
+    pivot_sr = df.pivot(index="Tau", columns="Gamma", values="Success_Rate")
     
-    # Left Panel: Tau Sweep
-    ax1.plot(tau_vals, tau_sr, marker='s', color="#1a6faf", lw=2.0, markersize=7)
-    ax1.set_ylim(-0.05, 1.05)
-    ax1.set_ylabel("Success Rate", fontsize=10)
-    ax1.set_xlabel("Lag Window ($\\tau$)", fontsize=10)
-    ax1.set_xticks(tau_vals)
-    ax1.grid(True, linestyle='--', alpha=0.5)
-    ax1.set_title("Robustness to Lag ($\\gamma=0.01$)", fontsize=11)
+    # Sort index so larger Tau is at the top or bottom depending on preference
+    pivot_sr = pivot_sr.sort_index(ascending=False) 
 
-    # Right Panel: Gamma Sweep
-    ax2.plot(gamma_vals, gamma_sr, marker='o', color="#7b2d7b", lw=2.0, markersize=7)
-    ax2.set_xscale('log')
-    ax2.set_xlabel("EMA Discount ($\\gamma$)", fontsize=10)
-    ax2.set_xticks(gamma_vals)
-    ax2.set_xticklabels([f"{g:g}" for g in gamma_vals])
-    ax2.grid(True, linestyle='--', alpha=0.5)
-    ax2.set_title("Robustness to Discount ($\\tau=10$)", fontsize=11)
-
+    fig, ax = plt.subplots(figsize=(5.5, 4.0))
+    
+    # Draw heatmap
+    sns.heatmap(pivot_sr, annot=True, fmt=".2f", cmap="YlGnBu", 
+                vmin=0, vmax=1, cbar_kws={'label': 'Success Rate'}, ax=ax)
+    
+    ax.set_title(r"Success Rate Robustness ($\tau$ vs $\gamma$)", fontsize=11, pad=10)
+    ax.set_ylabel("Lag Window ($\\tau$)", fontsize=10)
+    ax.set_xlabel("EMA Discount ($\\gamma$)", fontsize=10)
+    
     fig.tight_layout()
     fig.savefig(filepath, bbox_inches="tight")
     fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved Hyperparameter Ablation Plot -> {filepath}")
+    print(f"  Saved Hyperparameter Heatmap -> {filepath}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 9. MAIN EXECUTION SCRIPT
