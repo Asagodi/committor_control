@@ -67,22 +67,91 @@ PLOT_CONFIG = {
 }
 
 def set_ieee_style():
-    """Applies IEEE CDC-compliant styling."""
+    """Applies IEEE CDC-compliant styling with high-quality output."""
     plt.rcParams.update({
         "font.family": "serif",
         "font.serif": ["Times New Roman", "DejaVu Serif"],
         "mathtext.fontset": "stix",
-        "axes.labelsize": 10,
-        "axes.titlesize": 10,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+        "axes.labelsize": 11,
+        "axes.titlesize": 11,
         "xtick.labelsize": 9,
         "ytick.labelsize": 9,
         "legend.fontsize": 8,
         "axes.linewidth": 0.8,
-        "grid.linewidth": 0.5,
-        "grid.alpha": 0.5,
+        "grid.linewidth": 0.4,
+        "grid.alpha": 0.3,
         "lines.linewidth": 1.5,
-        "figure.dpi": 300
+        "lines.markersize": 5,
+        "figure.dpi": 300,
+        "savefig.dpi": 300,
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.05,
     })
+
+# Metric colors: blue family = success rate, warm family = energy
+C_SUCCESS = "#1a3a5c"
+C_ENERGY  = "#b5432a"
+
+# Method visual encoding: marker + linestyle (color comes from metric)
+METHOD_STYLE = {
+    "Optimal":            dict(marker="s", ls="-",  lw=1.8, label="Model-based"),
+    "CCA":                dict(marker="o", ls="--", lw=1.5, label="Data-enabled (wSVD)"),
+    "CCA (Adaptive)":     dict(marker="D", ls="-.", lw=1.5, label="Closed-loop"),
+    "CCA (Whitened)":     dict(marker="o", ls="--", lw=1.5, label="Data-enabled (wSVD)"),
+    "Oracle Committor":   dict(marker="s", ls="-",  lw=1.8, label="Committor (oracle)"),
+    "Oracle ReLU":        dict(marker="v", ls="-",  lw=1.5, label="ReLU (oracle)"),
+    "Est CCA Committor":  dict(marker="o", ls="--", lw=1.5, label="Committor (wSVD)"),
+    "Est CCA ReLU":       dict(marker="v", ls="--", lw=1.5, label="ReLU (wSVD)"),
+    "Est VAR Committor":  dict(marker="p", ls=":",  lw=1.5, label="Committor (VAR)"),
+}
+
+def _get_method_style(method):
+    return METHOD_STYLE.get(method, dict(marker="x", ls="-", lw=1.2, label=method))
+
+def _save_fig(fig, filepath):
+    """Save as both PDF and PNG."""
+    d = os.path.dirname(filepath)
+    if d: os.makedirs(d, exist_ok=True)
+    fig.savefig(filepath, bbox_inches="tight")
+    alt = filepath.replace('.pdf', '.png') if filepath.endswith('.pdf') else filepath.replace('.png', '.pdf')
+    fig.savefig(alt, bbox_inches="tight")
+    print(f"  Saved -> {filepath}")
+    plt.close(fig)
+
+def _make_log_axis(noises):
+    """Map noise levels to pseudo-log x positions (D=0 gets a spot left of min)."""
+    non_zero = sorted([n for n in noises if n > 0])
+    pseudo_zero = non_zero[0] / 3.0 if non_zero else 0.0001
+    def map_x(n): return pseudo_zero if n == 0.0 else n
+    return pseudo_zero, map_x, non_zero
+
+def _read_sweep_csv(csv_filepath, sys_name=None):
+    """Read sweep CSV, backward-compatible with old and new formats."""
+    if not os.path.exists(csv_filepath): return []
+    data = []
+    with open(csv_filepath, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if sys_name and row.get('System', '') != sys_name: continue
+            entry = {'Method': row['Method'], 'Noise_D': float(row['Noise_D']),
+                     'Success_Rate': float(row['Success_Rate'])}
+            if 'Mean_Energy_Succ' in row:
+                entry['Mean_Energy_Succ'] = float(row['Mean_Energy_Succ'])
+                entry['Std_Energy_Succ']  = float(row['Std_Energy_Succ'])
+                entry['N_Success']        = int(row['N_Success'])
+                entry['Mean_Energy_All']  = float(row['Mean_Energy_All'])
+                entry['Std_Energy_All']   = float(row['Std_Energy_All'])
+            elif 'Mean_Energy' in row:
+                me = float(row['Mean_Energy']); se = float(row.get('Std_Energy', 0.0)); ns = int(row.get('N_Success', 0))
+                entry['Mean_Energy_Succ'] = me; entry['Std_Energy_Succ'] = se; entry['N_Success'] = ns
+                entry['Mean_Energy_All'] = me; entry['Std_Energy_All'] = se
+            else:
+                entry['Mean_Energy_Succ'] = 0.0; entry['Std_Energy_Succ'] = 0.0; entry['N_Success'] = 0
+                entry['Mean_Energy_All'] = 0.0; entry['Std_Energy_All'] = 0.0
+            data.append(entry)
+    return data
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 1. Math helpers
@@ -120,29 +189,6 @@ def _sym_inv_sqrt(mat, reg=1e-6):
     floor = max(np.max(vals) * reg, 1e-12)
     vals = np.maximum(vals, floor)
     return vecs @ np.diag(1.0 / np.sqrt(vals)) @ vecs.T
-
-def generate_initial_conditions(sys, a, num_trajs, seed=11, u_min_frac=0.02, u_max_frac=0.5, s_spread_frac=0.5):
-    """
-    Standardized initial condition generator for all experiments.
-    Scales perfectly with the safety boundary 'a'.
-    """
-    w_u_norm = sys.w_u_true / np.linalg.norm(sys.w_u_true)
-    
-    # Generate a consistent orthogonal stable direction
-    w_s = np.random.default_rng(42).standard_normal(sys.x_star.size)
-    w_s -= np.dot(w_s, w_u_norm) * w_u_norm
-    w_s /= np.linalg.norm(w_s) + 1e-15
-    
-    rng_ic = np.random.default_rng(seed)
-    
-    # Sample dynamically based on fractions of the boundary 'a'
-    ics = [
-        sys.x_star 
-        + rng_ic.uniform(a * u_min_frac, a * u_max_frac) * w_u_norm 
-        + rng_ic.uniform(-a * s_spread_frac, a * s_spread_frac) * w_s 
-        for _ in range(num_trajs)
-    ]
-    return ics, rng_ic
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 2. Controllers
@@ -823,58 +869,8 @@ def plot_convergence_from_data(csv_filepath, sys_lambda_true=2.0, sys_D_true=0.0
     plt.close(fig)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6c. Sweep & Scaling Helpers 
+# 6c. Noise sweep & energy sweep
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _plot_energy_panel(ax, data_en, noises, methods_in_data, pseudo_zero, map_x, label_fontsize, legend_fontsize, energy_ylim=None, energy_yticks=None):
-    """Shared helper to plot the Mean Energy panel with SEM shading."""
-    c_opt = PLOT_CONFIG["COLORS"].get("Optimal"); c_cca = PLOT_CONFIG["COLORS"].get("CCA"); c_adapt = PLOT_CONFIG["COLORS"].get("CCA (Adaptive)")
-    lbl_map = {'Optimal': 'Model-based', 'CCA': 'Data-enabled', 'CCA (Adaptive)': 'Closed-loop'}
-    color_map = {'Optimal': c_opt, 'CCA': c_cca, 'CCA (Adaptive)': c_adapt}
-    ls_map = {'Optimal': '-', 'CCA': '--', 'CCA (Adaptive)': '-.'}
-    marker_map = {'Optimal': 's', 'CCA': 'o', 'CCA (Adaptive)': 'd'}
-
-    for method in methods_in_data:
-        xs_zero, ys_zero, sem_zero = [], [], []
-        xs_pos, ys_pos, sem_pos = [], [], []
-        for n in noises:
-            if method == "Optimal" and n == 0.0: continue
-            row = next((r for r in data_en if r['Noise_D'] == n and r['Method'] == method), None)
-            if row:
-                sem = row['Std_Energy'] / np.sqrt(max(row['N_Success'], 1)) if row.get('N_Success', 0) > 0 else 0.0
-                if n == 0.0:
-                    xs_zero.append(map_x(n)); ys_zero.append(row['Mean_Energy']); sem_zero.append(sem)
-                else:
-                    xs_pos.append(map_x(n)); ys_pos.append(row['Mean_Energy']); sem_pos.append(sem)
-
-        col = color_map.get(method, "#000"); ls = ls_map.get(method, "-"); lbl = lbl_map.get(method, method); mrk = marker_map.get(method, "s")
-        
-        if xs_zero: ax.plot(xs_zero, ys_zero, marker=mrk, color=col, ls='none', lw=1.5, markersize=5, label=lbl if not xs_pos else "")
-        if xs_pos: ax.plot(xs_pos, ys_pos, marker=mrk, color=col, ls=ls, lw=1.5, markersize=5, label=lbl)
-
-        ys_pos, sem_pos = np.array(ys_pos), np.array(sem_pos)
-        ys_zero, sem_zero = np.array(ys_zero), np.array(sem_zero)
-
-        if len(xs_pos) > 0 and np.any(sem_pos > 0):
-            ax.fill_between(xs_pos, ys_pos - 1.96*sem_pos, ys_pos + 1.96*sem_pos, color=col, alpha=0.15)
-        if len(xs_zero) > 0 and np.any(sem_zero > 0):
-            ax.fill_between(xs_zero, ys_zero - 1.96*sem_zero, ys_zero + 1.96*sem_zero, color=col, alpha=0.15)
-
-    all_en = [d['Mean_Energy'] for d in data_en if d['Method'] in methods_in_data and d['Mean_Energy'] > 0]
-    if energy_ylim: ax.set_ylim(energy_ylim)
-    elif all_en: ax.set_ylim(min(all_en)*0.8, max(all_en)*1.2)
-    
-    if energy_yticks: ax.set_yticks(energy_yticks)
-    if pseudo_zero > 0: ax.axvline(x=pseudo_zero * 1.5, color='gray', linestyle=':', alpha=0.5)
-
-    ax.set_ylabel("Mean control energy", fontsize=label_fontsize)
-    ax.set_xscale('log')
-    if noises:
-        ax.set_xticks([map_x(n) for n in noises])
-        ax.set_xticklabels(['0' if n == 0.0 else f"{n:.3g}" for n in noises], rotation=45, ha='right')
-    ax.set_xlabel("Noise strength ($D$)", fontsize=label_fontsize)
-    ax.legend(loc='upper left', fontsize=legend_fontsize)
-
 
 def plot_noise_sweep(csv_filepath="figures/dimensionality_scaling_stats.csv", plot_grid=False, log_x=True, fontsize=10):
     set_ieee_style()
@@ -940,7 +936,9 @@ def simulate_and_save_noise_energy_sweep(sys, a=0.5, dt=0.01, r_neigh=np.inf, nu
     os.makedirs(os.path.dirname(csv_filepath), exist_ok=True)
     with open(csv_filepath, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["System", "Method", "Noise_D", "Success_Rate", "Mean_Energy", "Std_Energy", "N_Success"])
+        writer.writerow(["System", "Method", "Noise_D", "Success_Rate", "N_Total",
+                         "Mean_Energy_Succ", "Std_Energy_Succ", "N_Success",
+                         "Mean_Energy_All", "Std_Energy_All", "N_All"])
         for D_test in noise_levels:
             tracker = CCATracker(dim=sys.x_star.size, dt=dt, tau=tau, rng_seed=0, use_whitened=use_whitened)
             tracker.train(sys.drift, T_train, dt, max(D_test, 0.005), 0, a, sys.w_u_true, init_center=sys.x_star, r_neigh=r_neigh)
@@ -950,14 +948,15 @@ def simulate_and_save_noise_energy_sweep(sys, a=0.5, dt=0.01, r_neigh=np.inf, nu
             if D_test < 1e-8: c_opt = partial(relu_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
             else: c_opt = partial(erf_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
             rng_ic = np.random.default_rng(11)
-            ics, rng_ic = generate_initial_conditions(sys, a, num_trajs)
+            ics = [sys.x_star + rng_ic.uniform(0.02, a * 0.9) * w_u_norm + rng_ic.uniform(-a * 0.4, a * 0.4) * w_s for _ in range(num_trajs)]
             methods_config = [
                 ('Optimal', c_opt, False, False, None),
                 ('CCA', None, True, False, tracker),
                 ('CCA (Adaptive)', None, True, True, tracker_online)
             ]
             for method_name, ctrl, use_tracker, is_adaptive, trk in methods_config:
-                successes, energies = 0, []
+                successes = 0
+                energies_succ, energies_all = [], []
                 for x0 in ics:
                     run_rng = np.random.default_rng(int(rng_ic.integers(0, 10**6)))
                     if use_tracker:
@@ -965,128 +964,145 @@ def simulate_and_save_noise_energy_sweep(sys, a=0.5, dt=0.01, r_neigh=np.inf, nu
                         traj, hit_side, energy = simulate_adaptive_trajectory(x0, T_sim, dt, sys.drift, D_test, tr_copy, sys, a, r_neigh, None, run_rng, is_adaptive=is_adaptive)
                     else:
                         traj, hit_side, energy = simulate_trajectory(x0, T_sim, dt, sys.drift, D_test, ctrl, sys, a, run_rng)
-                    if hit_side == "reached_A" or (D_test < 1e-8 and hit_side == "timeout"):
-                        successes += 1; energies.append(energy)
+                    energies_all.append(energy)
+                    if hit_side == "reached_A":
+                        successes += 1; energies_succ.append(energy)
                 succ_rate = successes / num_trajs
-                mean_energy = np.mean(energies) if energies else 0.0
-                std_energy = np.std(energies) if energies else 0.0
-                writer.writerow([sys.name, method_name, D_test, succ_rate, mean_energy, std_energy, len(energies)])
-                print(f"  {sys.name} | {method_name:<20} | D={D_test:.4f} | Success={succ_rate:.2f} | E={mean_energy:.3f} ± {std_energy:.3f}")
+                me_s = np.mean(energies_succ) if energies_succ else 0.0
+                se_s = np.std(energies_succ) if energies_succ else 0.0
+                me_a = np.mean(energies_all) if energies_all else 0.0
+                se_a = np.std(energies_all) if energies_all else 0.0
+                writer.writerow([sys.name, method_name, D_test, succ_rate, num_trajs,
+                                 me_s, se_s, len(energies_succ), me_a, se_a, len(energies_all)])
+                print(f"  {sys.name} | {method_name:<20} | D={D_test:.4f} | SR={succ_rate:.2f} | E_succ={me_s:.3f}±{se_s:.3f} | E_all={me_a:.3f}")
 
 def plot_noise_energy_sweep_data(csv_filepath="figures/noise_energy_sweep.csv", sys_name=None, filepath="figures/noise_energy_sweep.pdf", fontsize=10):
+    """Single-panel energy-only plot (legacy wrapper). Uses color-by-metric style."""
     set_ieee_style()
-    if not os.path.exists(csv_filepath): return
-    
-    data = []
-    with open(csv_filepath, 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            entry = {'System': row['System'], 'Method': row['Method'], 'Noise_D': float(row['Noise_D']),
-                     'Success_Rate': float(row['Success_Rate']), 'Mean_Energy': float(row['Mean_Energy'])}
-            if 'Std_Energy' in row and 'N_Success' in row:
-                entry['Std_Energy'] = float(row['Std_Energy'])
-                entry['N_Success'] = int(row['N_Success'])
-            else:
-                entry['Std_Energy'] = 0.0
-                entry['N_Success'] = 0
-            data.append(entry)
-            
-    if sys_name and any(d['System'] == sys_name for d in data):
-        data = [d for d in data if d['System'] == sys_name]
-        
+    data = _read_sweep_csv(csv_filepath, sys_name)
     if not data: return
-
-    noises = sorted(list(set(d['Noise_D'] for d in data)))
+    noises = sorted(set(d['Noise_D'] for d in data))
+    pseudo_zero, map_x, non_zero = _make_log_axis(noises)
     methods_in_data = ["Optimal", "CCA", "CCA (Adaptive)"]
-    non_zero_noises = [n for n in noises if n > 0]
-    pseudo_zero = min(non_zero_noises) / 3.0 if non_zero_noises else 0.0001
-    def map_x(n): return pseudo_zero if n == 0.0 else n
-
     fig, ax = plt.subplots(1, 1, figsize=(4.5, 3.5))
-    _plot_energy_panel(ax, data, noises, methods_in_data, pseudo_zero, map_x, 
-                       label_fontsize=fontsize, legend_fontsize=fontsize-1)
-
-    ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-    fig.tight_layout()
-    fig.savefig(filepath, bbox_inches="tight")
-    fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved energy sweep plot -> {filepath}")
+    for method in methods_in_data:
+        sty = _get_method_style(method)
+        xs, ys = [], []
+        for n in noises:
+            if method == "Optimal" and n == 0.0: continue
+            row = next((r for r in data if r['Noise_D'] == n and r['Method'] == method), None)
+            if row: xs.append(map_x(n)); ys.append(row['Mean_Energy_Succ'])
+        if xs: ax.plot(xs, ys, marker=sty['marker'], color=C_ENERGY, ls=sty['ls'], lw=sty['lw'], markersize=5, label=sty['label'])
+    ax.set_xscale('log'); ax.set_xticks([map_x(n) for n in noises])
+    ax.set_xticklabels(['0' if n == 0.0 else f"{n:.3g}" for n in noises], rotation=45, ha='right')
+    all_en = [d['Mean_Energy_Succ'] for d in data if d['Method'] in methods_in_data and d['Mean_Energy_Succ'] > 0]
+    if all_en: ax.set_ylim(min(all_en)*0.8, max(all_en)*1.25)
+    if non_zero: ax.axvline(x=pseudo_zero * 1.5, color='gray', ls=':', alpha=0.4, lw=0.6)
+    ax.set_xlabel("Noise strength ($D$)", fontsize=fontsize)
+    ax.set_ylabel("Mean control energy", fontsize=fontsize, color=C_ENERGY)
+    ax.tick_params(axis='y', colors=C_ENERGY)
+    ax.legend(loc='upper left', fontsize=fontsize-1)
+    _save_fig(fig, filepath)
 
 def plot_noise_energy_sweep_single_sys(sys, a=0.5, dt=0.01, r_neigh=np.inf, num_trajs=100, T_sim=2000, T_train=2500, tau=10, use_whitened=True, noise_levels=None, filepath="figures/noise_energy_sweep.pdf"):
     csv_path = filepath.replace(".pdf", ".csv")
     simulate_and_save_noise_energy_sweep(sys, a, dt, r_neigh, num_trajs, T_sim, T_train, tau, use_whitened, noise_levels, csv_path)
     plot_noise_energy_sweep_data(csv_path, sys.name, filepath)
 
-def plot_success_and_energy_vs_noise(csv_filepath, sys_name, filepath, layout="stacked", include_adaptive=False, label_fontsize=11, legend_fontsize=9):
-    """Plots Success Rate and Mean Energy (with SEM error bars) vs Noise (D)."""
+def plot_success_and_energy_vs_noise(csv_filepath, sys_name, filepath,
+                                     layout="stacked", include_adaptive=False,
+                                     show_spread=True,
+                                     ylim_sr=(-0.05, 1.05), ylim_energy=None,
+                                     figsize=(5.5, 5.5),
+                                     label_fontsize=11, legend_fontsize=8):
+    """
+    Publication-quality stacked sweep plot. Color encodes metric
+    (navy = success rate, warm = energy), markers/linestyles encode method.
+    """
     set_ieee_style()
-    if not os.path.exists(csv_filepath): print(f"     [ERROR] {csv_filepath} not found"); return
-    data = []
-    with open(csv_filepath, 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row['System'] == sys_name:
-                entry = {'Method': row['Method'], 'Noise_D': float(row['Noise_D']),
-                         'Success_Rate': float(row['Success_Rate']), 'Mean_Energy': float(row['Mean_Energy'])}
-                if 'Std_Energy' in row and 'N_Success' in row:
-                    entry['Std_Energy'] = float(row['Std_Energy']); entry['N_Success'] = int(row['N_Success'])
-                else:
-                    entry['Std_Energy'] = 0.0; entry['N_Success'] = 0
-                data.append(entry)
-                
-    if not data: print(f"     [ERROR] No data for {sys_name}"); return
-    
+    data = _read_sweep_csv(csv_filepath, sys_name)
+    if not data: print(f"     [ERROR] No data for {sys_name} in {csv_filepath}"); return
+
     noises = sorted(set(d['Noise_D'] for d in data))
-    non_zero_noises = [n for n in noises if n > 0]
-    pseudo_zero = min(non_zero_noises) / 3.0 if non_zero_noises else 0.0001
-    def map_x(n): return pseudo_zero if n == 0.0 else n
-    
+    pseudo_zero, map_x, non_zero = _make_log_axis(noises)
+
     methods = ["Optimal", "CCA"]
     if include_adaptive: methods.append("CCA (Adaptive)")
-    color_map = {'Optimal': PLOT_CONFIG["COLORS"]["Optimal"], 'CCA': PLOT_CONFIG["COLORS"]["CCA"], 'CCA (Adaptive)': PLOT_CONFIG["COLORS"]["CCA (Adaptive)"]}
-    lbl_map = {'Optimal': 'Model-based', 'CCA': 'Data-enabled', 'CCA (Adaptive)': 'Closed-loop'}
-    
-    if layout == "stacked":
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(5.0, 5.5), sharex=True); fig.subplots_adjust(hspace=0.1)
-        for method in methods:
-            xs_zero, ys1_zero = [], []
-            xs_pos, ys1_pos = [], []
-            for n in noises:
-                row = next((r for r in data if r['Noise_D'] == n and r['Method'] == method), None)
-                if row:
-                    if n == 0.0: xs_zero.append(map_x(n)); ys1_zero.append(row['Success_Rate'])
-                    else: xs_pos.append(map_x(n)); ys1_pos.append(row['Success_Rate'])
-            
-            col = color_map.get(method, "#000"); lbl = lbl_map.get(method, method)
-            if xs_zero: ax1.plot(xs_zero, ys1_zero, marker='o', color=col, ls='none', lw=1.5, markersize=5)
-            if xs_pos: ax1.plot(xs_pos, ys1_pos, marker='o', color=col, ls='-', lw=1.5, markersize=5, label=lbl)
-            elif xs_zero: ax1.plot([], [], marker='o', color=col, ls='-', lw=1.5, markersize=5, label=lbl)
-            
-        ax1.set_ylim(-0.05, 1.05); ax1.set_ylabel("Success rate", fontsize=label_fontsize)
-        ax1.legend(loc='lower left', fontsize=legend_fontsize)
-        if non_zero_noises: ax1.axvline(x=pseudo_zero * 1.5, color='gray', linestyle=':', alpha=0.5)
 
-        _plot_energy_panel(ax2, data, noises, methods, pseudo_zero, map_x, label_fontsize, legend_fontsize)
-        fig.align_ylabels([ax1, ax2])
-        
-    fig.savefig(filepath, bbox_inches="tight"); fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight")
-    print(f"     Saved {layout} success/energy plot -> {filepath}"); plt.close(fig)
+    fig, (ax_sr, ax_en) = plt.subplots(2, 1, figsize=figsize, sharex=True)
+    fig.subplots_adjust(hspace=0.08)
+    legend_handles = []
 
+    for method in methods:
+        sty = _get_method_style(method)
+        xs_z, sr_z, en_z, sem_z = [], [], [], []
+        xs_p, sr_p, en_p, sem_p = [], [], [], []
+
+        for n in noises:
+            row = next((r for r in data if r['Noise_D'] == n and r['Method'] == method), None)
+            if not row: continue
+            ns = row.get('N_Success', 0)
+            sem = row['Std_Energy_Succ'] / np.sqrt(max(ns, 1)) if ns > 0 else 0.0
+            bucket = (xs_z, sr_z, en_z, sem_z) if n == 0.0 else (xs_p, sr_p, en_p, sem_p)
+            bucket[0].append(map_x(n)); bucket[1].append(row['Success_Rate'])
+            bucket[2].append(row['Mean_Energy_Succ']); bucket[3].append(sem)
+
+        # Success rate panel (navy)
+        if xs_z: ax_sr.plot(xs_z, sr_z, marker=sty['marker'], color=C_SUCCESS, ls='none', lw=sty['lw'], markersize=5)
+        if xs_p: ax_sr.plot(xs_p, sr_p, marker=sty['marker'], color=C_SUCCESS, ls=sty['ls'], lw=sty['lw'], markersize=5)
+        elif xs_z: ax_sr.plot([], [], marker=sty['marker'], color=C_SUCCESS, ls=sty.get('ls', '-'), lw=sty['lw'], markersize=5)
+
+        # Energy panel (warm) with optional spread
+        en_p_a, sem_p_a = np.array(en_p), np.array(sem_p)
+        en_z_a, sem_z_a = np.array(en_z), np.array(sem_z)
+        if xs_z:
+            ax_en.plot(xs_z, en_z_a, marker=sty['marker'], color=C_ENERGY, ls='none', lw=sty['lw'], markersize=5)
+            if show_spread and np.any(sem_z_a > 0):
+                ax_en.fill_between(xs_z, np.maximum(0, en_z_a - 1.96*sem_z_a), en_z_a + 1.96*sem_z_a, color=C_ENERGY, alpha=0.08)
+        if xs_p:
+            ax_en.plot(xs_p, en_p_a, marker=sty['marker'], color=C_ENERGY, ls=sty['ls'], lw=sty['lw'], markersize=5)
+            if show_spread and np.any(sem_p_a > 0):
+                ax_en.fill_between(xs_p, np.maximum(0, en_p_a - 1.96*sem_p_a), en_p_a + 1.96*sem_p_a, color=C_ENERGY, alpha=0.08)
+
+        legend_handles.append(Line2D([], [], color='#333', marker=sty['marker'], ls=sty['ls'], lw=sty['lw'], markersize=5, label=sty['label']))
+
+    ax_sr.set_ylim(ylim_sr)
+    ax_sr.set_ylabel("Success rate", fontsize=label_fontsize, color=C_SUCCESS)
+    ax_sr.tick_params(axis='y', colors=C_SUCCESS)
+    ax_sr.legend(handles=legend_handles, loc='lower left', fontsize=legend_fontsize, framealpha=0.9)
+
+    if ylim_energy is not None: ax_en.set_ylim(ylim_energy)
+    else:
+        all_en = [d['Mean_Energy_Succ'] for d in data if d['Method'] in methods and d['Mean_Energy_Succ'] > 0]
+        if all_en: ax_en.set_ylim(min(all_en)*0.8, max(all_en)*1.25)
+    ax_en.set_ylabel("Mean control energy", fontsize=label_fontsize, color=C_ENERGY)
+    ax_en.tick_params(axis='y', colors=C_ENERGY)
+    ax_en.set_xscale('log'); ax_en.set_xticks([map_x(n) for n in noises])
+    ax_en.set_xticklabels(['0' if n == 0.0 else f"{n:.3g}" for n in noises], rotation=45, ha='right')
+    ax_en.set_xlabel("Noise strength ($D$)", fontsize=label_fontsize)
+    if non_zero:
+        for ax in (ax_sr, ax_en): ax.axvline(x=pseudo_zero * 1.5, color='gray', ls=':', alpha=0.4, lw=0.6)
+    fig.align_ylabels([ax_sr, ax_en])
+    _save_fig(fig, filepath)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 6d. Combined scaling + energy plot
+# ──────────────────────────────────────────────────────────────────────────────
 
 def plot_scaling_and_energy(dim_csv_filepath, energy_csv_filepath, filepath="figures/combined_scaling_energy.pdf",
-                            include_adaptive=False, line_alpha=0.8, success_ylim=(0.45, 1.05), success_yticks=(0.5, 1.0),
-                            energy_ylim=None, energy_yticks=None, legend_fontsize=12, label_fontsize=12, title_fontsize=13):
+                            include_adaptive=False, line_alpha=0.8,
+                            success_ylim=(0.45, 1.05), success_yticks=(0.5, 1.0),
+                            energy_ylim=None, energy_yticks=None,
+                            legend_fontsize=12, label_fontsize=12, title_fontsize=13):
     set_ieee_style()
     fig, (ax_scale, ax_energy) = plt.subplots(2, 1, figsize=(6, 6.5), sharex=True)
     fig.subplots_adjust(hspace=0.1)
     print(f"  -> Plotting stacked combined figure...")
-    
-    noises, non_zero_noises = [], []
+    # --- PANEL A: DIMENSIONALITY SCALING ---
+    noises = []
+    non_zero_noises = []
     pseudo_zero = 0.0001
     def map_x(n): return pseudo_zero if n == 0.0 else n
-
-    # --- PANEL A: DIMENSIONALITY SCALING ---
     if os.path.exists(dim_csv_filepath):
         data_dim = []; methods_scale = ["CCA"]
         if include_adaptive: methods_scale.append("CCA (Adaptive)")
@@ -1103,7 +1119,7 @@ def plot_scaling_and_energy(dim_csv_filepath, energy_csv_filepath, filepath="fig
             noises = sorted(list(set(d['Noise_D'] for d in data_dim)))
             non_zero_noises = [n for n in noises if n > 0]
             pseudo_zero = min(non_zero_noises) / 2.0 if non_zero_noises else 0.0001
-            
+            def map_x(n): return pseudo_zero if n == 0.0 else n
             palettes = {
                 lams[0]: [plt.cm.Purples(x) for x in np.linspace(0.85, 0.4, len(dims))],
                 lams[1]: [plt.cm.Oranges(x) for x in np.linspace(0.85, 0.4, len(dims))]
@@ -1124,11 +1140,9 @@ def plot_scaling_and_energy(dim_csv_filepath, energy_csv_filepath, filepath="fig
                         col = colors[j]; mrk = dim_markers[j % len(dim_markers)]
                         if xs_zero: ax_scale.plot(xs_zero, ys_zero, marker=mrk, markersize=5, color=col, ls='none', alpha=alpha_val)
                         if xs_pos: ax_scale.plot(xs_pos, ys_pos, marker=mrk, markersize=5, color=col, ls=ls_val, lw=1.5, alpha=alpha_val)
-                        
             ax_scale.set_ylim(success_ylim); ax_scale.set_yticks(success_yticks)
             if non_zero_noises: ax_scale.axvline(x=pseudo_zero * 1.5, color='gray', linestyle=':', alpha=0.5)
             ax_scale.set_ylabel("Success rate", fontsize=label_fontsize)
-            
             legend_elements = [Line2D([0], [0], color='none', label=r'$\lambda_u$')]
             for lam in lams:
                 mid_color = palettes[lam][len(dims)//2]
@@ -1143,38 +1157,100 @@ def plot_scaling_and_energy(dim_csv_filepath, energy_csv_filepath, filepath="fig
                 legend_elements.append(Line2D([0], [0], color='gray', ls='-', lw=1.5, label=' Static'))
                 legend_elements.append(Line2D([0], [0], color='gray', ls='--', lw=1.5, label=' Adapt'))
             ax_scale.legend(handles=legend_elements, loc="lower left", fontsize=legend_fontsize, ncol=3 if include_adaptive else 2, framealpha=0.95)
-    else: print(f"     [ERROR] Could not find Dimensionality CSV at: {dim_csv_filepath}")
-
+    else:
+        print(f"     [ERROR] Could not find Dimensionality CSV at: {dim_csv_filepath}")
     # --- PANEL B: ENERGY SWEEP ---
-    if os.path.exists(energy_csv_filepath):
-        data_en = []
-        with open(energy_csv_filepath, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                entry = {'Method': row['Method'], 'Noise_D': float(row['Noise_D']), 'Mean_Energy': float(row['Mean_Energy'])}
-                if 'Std_Energy' in row and 'N_Success' in row:
-                    entry['Std_Energy'] = float(row['Std_Energy']); entry['N_Success'] = int(row['N_Success'])
-                else:
-                    entry['Std_Energy'] = 0.0; entry['N_Success'] = 0
-                data_en.append(entry)
-                
-        if data_en:
-            methods_in_data = ["Optimal", "CCA"]
-            if include_adaptive: methods_in_data.append("CCA (Adaptive)")
-            
-            if not noises:
-                noises = sorted(list(set(d['Noise_D'] for d in data_en)))
-                non_zero_noises = [n for n in noises if n > 0]
-                pseudo_zero = min(non_zero_noises) / 2.0 if non_zero_noises else 0.0001
-                
-            _plot_energy_panel(ax_energy, data_en, noises, methods_in_data, pseudo_zero, map_x, label_fontsize, legend_fontsize, energy_ylim, energy_yticks)
-    else: print(f"     [ERROR] Could not find Energy CSV at: {energy_csv_filepath}")
-
-    ax_scale.tick_params(axis='y', labelsize=label_fontsize); ax_energy.tick_params(axis='y', labelsize=label_fontsize)
+    data_en = _read_sweep_csv(energy_csv_filepath)
+    if data_en:
+        methods_en = ["Optimal", "CCA"]
+        if include_adaptive: methods_en.append("CCA (Adaptive)")
+        if not noises:
+            noises = sorted(set(d['Noise_D'] for d in data_en))
+            non_zero_noises = [n for n in noises if n > 0]
+            pseudo_zero = min(non_zero_noises) / 2.0 if non_zero_noises else 0.0001
+        for method in methods_en:
+            sty = _get_method_style(method)
+            xs, ys, sems = [], [], []
+            for n in noises:
+                if method == "Optimal" and n == 0.0: continue
+                row = next((r for r in data_en if r['Noise_D'] == n and r['Method'] == method), None)
+                if row:
+                    ns = row.get('N_Success', 0)
+                    sem = row['Std_Energy_Succ'] / np.sqrt(max(ns, 1)) if ns > 0 else 0.0
+                    xs.append(map_x(n)); ys.append(row['Mean_Energy_Succ']); sems.append(sem)
+            if xs:
+                ys_a, sems_a = np.array(ys), np.array(sems)
+                ax_energy.plot(xs, ys_a, marker=sty['marker'], color=C_ENERGY, ls=sty['ls'],
+                               lw=sty['lw'], markersize=5, label=sty['label'])
+                if np.any(sems_a > 0):
+                    ax_energy.fill_between(xs, np.maximum(0, ys_a - 1.96*sems_a),
+                                           ys_a + 1.96*sems_a, color=C_ENERGY, alpha=0.08)
+        all_en = [d['Mean_Energy_Succ'] for d in data_en if d['Method'] in methods_en and d['Mean_Energy_Succ'] > 0]
+        if energy_ylim: ax_energy.set_ylim(energy_ylim)
+        elif all_en: ax_energy.set_ylim(min(all_en)*0.8, max(all_en)*1.25)
+        if energy_yticks: ax_energy.set_yticks(energy_yticks)
+        if non_zero_noises: ax_energy.axvline(x=pseudo_zero * 1.5, color='gray', ls=':', alpha=0.4, lw=0.6)
+        ax_energy.set_ylabel("Mean control energy", fontsize=label_fontsize, color=C_ENERGY)
+        ax_energy.tick_params(axis='y', colors=C_ENERGY)
+        ax_energy.legend(loc='upper left', fontsize=legend_fontsize)
+    else:
+        print(f"     [ERROR] Could not find Energy CSV at: {energy_csv_filepath}")
+    ax_energy.set_xscale('log')
+    if noises:
+        ax_energy.set_xticks([map_x(n) for n in noises])
+        ax_energy.set_xticklabels(['0' if n == 0.0 else f"{n:.3g}" for n in noises], rotation=45, ha='right')
+    ax_energy.set_xlabel("Noise strength ($D$)", fontsize=label_fontsize)
+    ax_scale.tick_params(axis='y', labelsize=label_fontsize)
     fig.align_ylabels([ax_scale, ax_energy])
+    _save_fig(fig, filepath)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 6e. Control comparison
+# ──────────────────────────────────────────────────────────────────────────────
+
+def plot_control_comparison(sys, a=0.5, D_eval=0.01, dt=0.01, T_sim=1000, r_neigh=np.inf, T_train=2500, tau=10, use_whitened=True, num_trajs=10, filepath="figures/control_comparison.pdf"):
+    set_ieee_style()
+    tracker = OnlineCCATracker(dim=sys.x_star.size, dt=dt, gamma=0.01, tau=tau, min_steps=20, a=a, rng_seed=0, use_whitened=use_whitened)
+    tracker.train(sys.drift, T_train, dt, max(D_eval, 0.005), 0, sys.w_u_true, sys.x_star, r_neigh=r_neigh)
+    rng = np.random.default_rng(42)
+    w_u_norm = sys.w_u_true / np.linalg.norm(sys.w_u_true)
+    kw = dict(a=a, r_neigh=r_neigh)
+    c_opt = partial(erf_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_eval, x_fp=sys.x_star, **kw)
+    fig, axes = plt.subplots(2, 1, figsize=(6, 4.5), sharex=True)
+    c_opt_col = PLOT_CONFIG["COLORS"].get("Optimal"); c_cca_col = PLOT_CONFIG["COLORS"].get("CCA")
+    lbl_opt = PLOT_CONFIG["LABELS"].get("Optimal"); lbl_cca = PLOT_CONFIG["LABELS"].get("CCA")
+    alpha_val = 0.8 if num_trajs == 1 else max(0.02, 2.0 / num_trajs)
+    for i in range(num_trajs):
+        x0 = sys.x_star + rng.uniform(0.1, 0.3) * w_u_norm
+        noise_seq = np.sqrt(2.0 * D_eval) * rng.standard_normal((T_sim, sys.x_star.size)) * np.sqrt(dt)
+        x = x0.copy(); xu_opt, u_opt = [], []
+        for t in range(T_sim):
+            x_u = float(np.dot(sys.w_u_true, x - sys.x_star))
+            if abs(x_u) >= a: break
+            u = c_opt(x); xu_opt.append(x_u); u_opt.append(float(np.dot(sys.w_u_true, u)))
+            x = x + (sys.drift(t * dt, x) + u) * dt + noise_seq[t]
+        tracker_copy = copy.deepcopy(tracker); x = x0.copy(); xu_cca, u_cca = [], []; tracker_copy.reset()
+        for t in range(T_sim):
+            x_u = float(np.dot(sys.w_u_true, x - sys.x_star))
+            if abs(x_u) >= a: break
+            params = tracker_copy.get_params(sys.w_u_true)
+            u = erf_feedback(x, params['w_u'], params['lambda_u'], params['D'], params['x_star'], a, r_neigh)
+            u = np.clip(u, -50.0, 50.0); xu_cca.append(x_u); u_cca.append(float(np.dot(sys.w_u_true, u)))
+            drift_val = sys.drift(t * dt, x); x_next = x + (drift_val + u) * dt + noise_seq[t]
+            x_pseudo = x + drift_val * dt + noise_seq[t]; tracker_copy.update(x, x_pseudo, sys.w_u_true); x = x_next
+        time_opt = np.arange(len(xu_opt)) * dt; time_cca = np.arange(len(xu_cca)) * dt
+        l_opt = lbl_opt if i == 0 else ""; l_cca = lbl_cca if i == 0 else ""
+        axes[0].plot(time_opt, xu_opt, color=c_opt_col, lw=1.2, label=l_opt, alpha=alpha_val)
+        axes[0].plot(time_cca, xu_cca, color=c_cca_col, lw=1.2, label=l_cca, alpha=alpha_val)
+        axes[1].plot(time_opt, u_opt, color=c_opt_col, lw=1.2, alpha=alpha_val)
+        axes[1].plot(time_cca, u_cca, color=c_cca_col, lw=1.2, alpha=alpha_val)
+    axes[0].axhline(0, color='grey', ls=':', lw=0.8); axes[0].axhline(a, color='#cc0000', ls='--', lw=0.8, alpha=0.7)
+    axes[0].axhline(-a, color='#208820', ls='--', lw=0.8, alpha=0.7)
+    axes[0].set_ylabel(r"$x_u = w_u^\top(x - x^\ast)$"); axes[0].legend(loc="upper right")
+    axes[1].axhline(0, color='grey', ls=':', lw=0.8); axes[1].set_xlabel("Time"); axes[1].set_ylabel(r"$w_u^\top u(x)$ (control effort)")
+    fig.tight_layout()
     fig.savefig(filepath, bbox_inches="tight"); fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight")
-    print(f"     Saved stacked scaling & energy plot -> {filepath}")
-    plt.close(fig)
+    plt.close(fig); print(f"Saved control comparison -> {filepath}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 7. Base Evaluation Suite
@@ -1189,29 +1265,23 @@ def run_evaluation_suite(sys, B_restrictive=None, a=0.5, r_neigh=np.inf, D_eval=
     T_sim, T_budget, seed = 5000, 2500, 11
     if methods_to_run is None: methods_to_run = ["Autonomous", "CCA"]
     D_train = max(D_eval, 0.005)
-    
     alg_algo1 = CCATracker(dim=sys.x_star.size, dt=dt, tau=tau, rng_seed=0, use_whitened=False)
     alg_algo1.train(sys.drift, T_budget, dt, D_train, 0, a, sys.w_u_true, init_center=sys.x_star, r_neigh=r_neigh)
     p_algo1 = alg_algo1.get_params(sys.w_u_true)
-    
     alg_whitened = CCATracker(dim=sys.x_star.size, dt=dt, tau=tau, rng_seed=0, use_whitened=True)
     alg_whitened.train(sys.drift, T_budget, dt, D_train, 0, a, sys.w_u_true, init_center=sys.x_star, r_neigh=r_neigh)
     p_whitened = alg_whitened.get_params(sys.w_u_true)
-    
     alg_online = OnlineCCATracker(dim=sys.x_star.size, dt=dt, gamma=0.01, tau=tau, min_steps=20, a=a, rng_seed=0, use_whitened=use_whitened)
     alg_online.train(sys.drift, T_budget, dt, D_train, 0, sys.w_u_true, sys.x_star, r_neigh=r_neigh)
     p_online = alg_online.get_params(sys.w_u_true)
-    
-    print(f"  True:               lambda_u={sys.lambda_u_true:.3f}, w_u={sys.w_u_true}")
+    print(f"  True:           lambda_u={sys.lambda_u_true:.3f}, w_u={sys.w_u_true}")
     if "CCA (Algo 1)" in methods_to_run: print(f"  CCA (Algo 1):   lambda_u={p_algo1['lambda_u']:.3f}, D={p_algo1['D']:.5f}, w_u={p_algo1['w_u']}")
     if "CCA (Whitened)" in methods_to_run: print(f"  CCA (Whitened): lambda_u={p_whitened['lambda_u']:.3f}, D={p_whitened['D']:.5f}, w_u={p_whitened['w_u']}")
     if "CCA (Adaptive)" in methods_to_run: print(f"  CCA (Adaptive): lambda_u={p_online['lambda_u']:.3f}, D={p_online['D']:.5f}, w_u={p_online['w_u']}")
-    
     kw = dict(a=a, r_neigh=r_neigh)
     c_opt = partial(erf_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_eval, x_fp=sys.x_star, **kw)
     alg_default = alg_whitened if use_whitened else alg_algo1
     p_default = p_whitened if use_whitened else p_algo1
-    
     all_methods = {
         "Autonomous":      (PLOT_CONFIG["LABELS"]["Autonomous"],      None,  PLOT_CONFIG["COLORS"]["Autonomous"],      None,               None,         False),
         "Optimal":         (PLOT_CONFIG["LABELS"]["Optimal"],         c_opt, PLOT_CONFIG["COLORS"]["Optimal"],         None,               None,         False),
@@ -1221,13 +1291,11 @@ def run_evaluation_suite(sys, B_restrictive=None, a=0.5, r_neigh=np.inf, D_eval=
         "CCA (Adaptive)":  (PLOT_CONFIG["LABELS"]["CCA (Adaptive)"],  None,  PLOT_CONFIG["COLORS"]["CCA (Adaptive)"],  p_online['w_u'],    alg_online,   True),
     }
     methods = [(m,) + all_methods[m] for m in methods_to_run if m in all_methods]
-    
     w_u_norm = sys.w_u_true / np.linalg.norm(sys.w_u_true)
     w_s = np.random.default_rng(42).standard_normal(sys.x_star.size)
     w_s -= np.dot(w_s, w_u_norm) * w_u_norm; w_s /= np.linalg.norm(w_s) + 1e-15
     rng_ic = np.random.default_rng(seed)
-    ics, rng_ic = generate_initial_conditions(sys, a, num_trajs, seed=seed, s_spread_frac=spread_s)
-    
+    ics = [sys.x_star + rng_ic.uniform(0.02, a*0.9)*w_u_norm + rng_ic.uniform(-a*spread_s, a*spread_s)*w_s for _ in range(num_trajs)]
     single_trajs, multi_trajs = [], []
     for raw_name, display_label, ctrl, col, est_dir, tracker, is_adaptive in methods:
         t_list = []
@@ -1238,41 +1306,34 @@ def run_evaluation_suite(sys, B_restrictive=None, a=0.5, r_neigh=np.inf, D_eval=
             else:
                 X, hs, en = simulate_trajectory(x0, T_sim, dt, sys.drift, D_eval, ctrl, sys, a, run_rng)
             t_list.append((X, hs, en))
-            
-        n_success = sum(1 for _, hs, _ in t_list if hs == "reached_A" or (D_eval < 1e-8 and hs == "timeout"))
+        n_success = sum(1 for _, hs, _ in t_list if hs == "reached_A")
         n_time = sum(1 for _, hs, _ in t_list if hs == "timeout")
         n_fail = sum(1 for _, hs, _ in t_list if hs == "hit_B")
-        energies_succ = [en for _, hs, en in t_list if hs == "reached_A" or (D_eval < 1e-8 and hs == "timeout")]
+        energies_succ = [en for _, hs, en in t_list if hs == "reached_A"]
         energies_all = [en for _, _, en in t_list]
         avg_en_succ = np.mean(energies_succ) if energies_succ else 0.0
         avg_en_all = np.mean(energies_all) if energies_all else 0.0
-        
         print(f"  {raw_name:<20} Reach A = {n_success}/{num_trajs} | Time = {n_time}/{num_trajs} | Fail = {n_fail}/{num_trajs} | E(succ) = {avg_en_succ:.3f} | E(all) = {avg_en_all:.3f}")
         stats_str = f"Reach A: {n_success}/{num_trajs} | Fail: {n_fail} | Time: {n_time}\nE(succ): {avg_en_succ:.2f} | E(all): {avg_en_all:.2f}"
-        
         if raw_name in ["CCA", "CCA (Whitened)"]: stats_str += f"\n$\\hat{{\\lambda}}_u$={p_whitened['lambda_u']:.2f}, $\\hat{{D}}$={p_whitened['D']:.4f}"
         elif raw_name == "CCA (Algo 1)": stats_str += f"\n$\\hat{{\\lambda}}_u$={p_algo1['lambda_u']:.2f}, $\\hat{{D}}$={p_algo1['D']:.4f}"
         elif raw_name == "CCA (Adaptive)": stats_str += f"\n$\\hat{{\\lambda}}_u$={p_online['lambda_u']:.2f}, $\\hat{{D}}$={p_online['D']:.4f}"
-        
         single_trajs.append((display_label, col, est_dir, [t_list[0]], stats_str))
         multi_trajs.append((display_label, col, est_dir, t_list[:plot_trajs], stats_str))
-        
     clean_mode_str = mode_str.replace(" ", "_").replace("(", "").replace(")", "").replace(".", "")
     suffix = f"_{file_suffix}_{clean_mode_str}" if file_suffix else f"_{clean_mode_str}"
     plot_trajectory_panels(multi_trajs, sys, a, is_single=False, filepath=f"figures/{sys.name}{suffix}_multi_traj.png")
     plot_trajectory_panels(single_trajs, sys, a, is_single=True, combined=True, filepath=f"figures/{sys.name}{suffix}_single_traj_combined.png")
 
-def run_dimensionality_scaling_experiment(dt=0.01, num_trajs=1000, T_sim=5000, use_whitened=True, dimensions=[2, 5, 10, 20], lambdas=[2.0, 5.0], noise_levels=[0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.075, 0.1]):
+def run_dimensionality_scaling_experiment(dt=0.01, num_trajs=1000, T_sim=5000, use_whitened=True, dimensions=[2, 5, 10, 20], lambdas=[2.0, 5.0],
+                                          noise_levels=[0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.075, 0.1]):
     print("\n" + "="*80)
     mode_str = "WHITENED CCA" if use_whitened else "STANDARD CCA (Algo 1)"
     print(f" Dimensionality Scaling Experiment | Mode: {mode_str}")
     print("="*80)
-    
-    a = 0.5
-    r_neigh = a
+    a, r_neigh = 0.5, np.inf
     clean_mode_str = mode_str.replace(" ", "_").replace("(", "").replace(")", "").replace(".", "")
     filepath = f"figures/dimensionality_scaling_stats_{clean_mode_str}.csv"
-    
     with open(filepath, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(["Dimension", "Lambda_u", "Noise_D", "Method", "Success_Rate", "Timeout_Rate", "Fail_Rate"])
@@ -1282,467 +1343,319 @@ def run_dimensionality_scaling_experiment(dt=0.01, num_trajs=1000, T_sim=5000, u
                 w_u_norm = sys.w_u_true / np.linalg.norm(sys.w_u_true)
                 w_s = np.random.default_rng(42).standard_normal(dim)
                 w_s -= np.dot(w_s, w_u_norm) * w_u_norm; w_s /= np.linalg.norm(w_s)+1e-15
-                
                 for D_test in noise_levels:
-                    ics, rng_ic = generate_initial_conditions(sys, a, num_trajs)
+                    rng_ic = np.random.default_rng(11)
+                    ics = [sys.x_star + rng_ic.uniform(0.02, a*0.9)*w_u_norm + rng_ic.uniform(-a*0.4, a*0.4)*w_s for _ in range(num_trajs)]
                     kw = dict(a=a, r_neigh=r_neigh)
-                    
                     if D_test < 1e-8: c_opt = partial(relu_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
                     else: c_opt = partial(erf_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
-                    
                     opt_results = [simulate_trajectory(x0, T_sim, dt, sys.drift, D_test, c_opt, sys, a, np.random.default_rng())[1] for x0 in ics]
-                    hits_opt = sum(1 for hs in opt_results if hs == "reached_A" or (D_test < 1e-8 and hs == "timeout"))
+                    hits_opt = sum(1 for hs in opt_results if hs == "reached_A")
                     time_opt = sum(1 for hs in opt_results if hs == "timeout")
                     fail_opt = sum(1 for hs in opt_results if hs == "hit_B")
-                    
                     D_train = max(D_test, 0.005)
                     alg = CCATracker(dim=dim, dt=dt, tau=10, rng_seed=0, use_whitened=use_whitened)
                     alg.train(sys.drift, 2500, dt, D_train, 0, a, sys.w_u_true, init_center=sys.x_star)
                     alg_online = OnlineCCATracker(dim=dim, dt=dt, gamma=0.01, tau=10, min_steps=20, a=a, rng_seed=0, use_whitened=use_whitened)
                     alg_online.train(sys.drift, 2500, dt, D_train, 0, sys.w_u_true, sys.x_star)
-                    
                     cca_results = [simulate_adaptive_trajectory(x0, T_sim, dt, sys.drift, D_test, copy.deepcopy(alg), sys, a, r_neigh, None, np.random.default_rng(), is_adaptive=False)[1] for x0 in ics]
-                    hits_cca = sum(1 for hs in cca_results if hs == "reached_A" or (D_test < 1e-8 and hs == "timeout"))
+                    hits_cca = sum(1 for hs in cca_results if hs == "reached_A")
                     time_cca = sum(1 for hs in cca_results if hs == "timeout")
                     fail_cca = sum(1 for hs in cca_results if hs == "hit_B")
-                    
                     cca_adapt_results = [simulate_adaptive_trajectory(x0, T_sim, dt, sys.drift, D_test, copy.deepcopy(alg_online), sys, a, r_neigh, None, np.random.default_rng(), is_adaptive=True)[1] for x0 in ics]
-                    hits_adapt = sum(1 for hs in cca_adapt_results if hs == "reached_A" or (D_test < 1e-8 and hs == "timeout"))
+                    hits_adapt = sum(1 for hs in cca_adapt_results if hs == "reached_A")
                     time_adapt = sum(1 for hs in cca_adapt_results if hs == "timeout")
                     fail_adapt = sum(1 for hs in cca_adapt_results if hs == "hit_B")
-                    
                     writer.writerow([dim, lam_u, D_test, "Optimal", hits_opt/num_trajs, time_opt/num_trajs, fail_opt/num_trajs])
                     writer.writerow([dim, lam_u, D_test, "CCA", hits_cca/num_trajs, time_cca/num_trajs, fail_cca/num_trajs])
                     writer.writerow([dim, lam_u, D_test, "CCA (Adaptive)", hits_adapt/num_trajs, time_adapt/num_trajs, fail_adapt/num_trajs])
                     print(f"  Dim {dim:2}, lam_u {lam_u:3}, D {D_test:5.3f} | Opt [A: {hits_opt/num_trajs:.2f}] | CCA [A: {hits_cca/num_trajs:.2f}] | Adapt [A: {hits_adapt/num_trajs:.2f}]")
-                    
     print(f"Saved -> {filepath}")
     plot_noise_sweep(filepath, plot_grid=False, log_x=True)
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-# 8. Baseline & Ablation Studies (For Reviewers)
+# 8. Baseline Comparisons & Ablations
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run_baseline_comparison(sys, a=0.5, r_neigh=np.inf, dt=0.01, num_trajs=100, T_sim=2000, T_train=2500, tau=10, noise_levels=None, csv_filepath="figures/baselines.csv"):
-    """Compares the Committor formulation against LQR and Sign-Gated (ReLU) baselines using BOTH Oracle and Estimated parameters."""
-    print(f"\n -> Running Baseline Comparison for {sys.name}...")
-    if noise_levels is None: noise_levels = [0.0, 0.005, 0.01, 0.05]
-    
+def run_baseline_comparison(sys, a=0.5, r_neigh=np.inf, D_eval=0.01, dt=0.01,
+                            num_trajs=500, T_sim=2000, T_train=2500, tau=10,
+                            noise_levels=None, csv_filepath="figures/baselines.csv"):
+    """Compare committor controller against LQR, sign-gated, and direct VAR baselines."""
+    if noise_levels is None: noise_levels = [0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1]
     w_u_norm = sys.w_u_true / np.linalg.norm(sys.w_u_true)
     w_s = np.random.default_rng(42).standard_normal(sys.x_star.size)
     w_s -= np.dot(w_s, w_u_norm) * w_u_norm; w_s /= np.linalg.norm(w_s) + 1e-15
     os.makedirs(os.path.dirname(csv_filepath), exist_ok=True)
-    
+    print(f"\n  Baseline comparison: {sys.name}")
     with open(csv_filepath, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["System", "Method", "Noise_D", "Success_Rate", "Timeout_Rate", "Fail_Rate", "Mean_Energy", "Std_Energy"])
-        
+        writer.writerow(["System", "Method", "Noise_D", "Success_Rate", "N_Total",
+                         "Mean_Energy_Succ", "Std_Energy_Succ", "N_Success",
+                         "Mean_Energy_All", "Std_Energy_All", "N_All"])
         for D_test in noise_levels:
             D_train = max(D_test, 0.005)
             kw = dict(a=a, r_neigh=r_neigh)
-            
-            # --- 1. Oracle Controllers (True System Parameters) ---
+            # --- Oracle controllers ---
             if D_test < 1e-8:
-                c_oracle_commit = partial(relu_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
+                c_committor = partial(relu_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
             else:
-                c_oracle_commit = partial(erf_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
-            
-            c_oracle_lqr = partial(lqr_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
-            c_oracle_relu = partial(relu_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
+                c_committor = partial(erf_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
+            c_lqr_oracle = partial(lqr_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
+            c_relu_oracle = partial(sign_gated_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
 
-            # --- 2. Train Trackers (Data-Driven Parameters) ---
+            # --- Whitened SVD estimator ---
             alg_wsvd = CCATracker(dim=sys.x_star.size, dt=dt, tau=tau, rng_seed=0, use_whitened=True)
             alg_wsvd.train(sys.drift, T_train, dt, D_train, 0, a, sys.w_u_true, init_center=sys.x_star, r_neigh=r_neigh)
             p_wsvd = alg_wsvd.get_params(sys.w_u_true)
 
+            # --- Direct VAR(1) estimator ---
             alg_var = DirectVARTracker(dim=sys.x_star.size, dt=dt, rng_seed=0)
-            alg_var.train(sys.drift, T_train, dt, D_train, 0, a, sys.w_u_true, sys.x_star, r_neigh=r_neigh)
+            alg_var.train(sys.drift, T_train, dt, D_train, 0, a, sys.w_u_true, init_center=sys.x_star, r_neigh=r_neigh)
             p_var = alg_var.get_params(sys.w_u_true)
 
-            # --- 3. Estimated Controllers (Using CCA/WSVD Parameters) ---
-            if D_test < 1e-8:
-                c_cca_commit = partial(relu_feedback, w_u=p_wsvd['w_u'], lambda_u=p_wsvd['lambda_u'], D=p_wsvd['D'], x_fp=p_wsvd['x_star'], **kw)
-                c_var_commit = partial(relu_feedback, w_u=p_var['w_u'], lambda_u=p_var['lambda_u'], D=p_var['D'], x_fp=p_var['x_star'], **kw)
-            else:
-                c_cca_commit = partial(erf_feedback, w_u=p_wsvd['w_u'], lambda_u=p_wsvd['lambda_u'], D=p_wsvd['D'], x_fp=p_wsvd['x_star'], **kw)
-                c_var_commit = partial(erf_feedback, w_u=p_var['w_u'], lambda_u=p_var['lambda_u'], D=p_var['D'], x_fp=p_var['x_star'], **kw)
+            # --- Build all controllers ---
+            def _make_ctrl(feedback_fn, params, D_ctrl):
+                return partial(feedback_fn, w_u=params['w_u'], lambda_u=params['lambda_u'], D=D_ctrl, x_fp=params['x_star'], **kw)
 
-            c_cca_lqr = partial(lqr_feedback, w_u=p_wsvd['w_u'], lambda_u=p_wsvd['lambda_u'], D=p_wsvd['D'], x_fp=p_wsvd['x_star'], **kw)
-            c_cca_relu = partial(relu_feedback, w_u=p_wsvd['w_u'], lambda_u=p_wsvd['lambda_u'], D=p_wsvd['D'], x_fp=p_wsvd['x_star'], **kw)
-
-            # --- Generate Initial Conditions ---
-            ics, rng_ic = generate_initial_conditions(sys, a, num_trajs)
-
-            # Compare apples to apples
-            methods_config = [
-                ('Oracle Committor', c_oracle_commit),
-                ('Oracle LQR', c_oracle_lqr),
-                ('Oracle ReLU', c_oracle_relu),
-                ('Est CCA Committor', c_cca_commit),
-                ('Est CCA LQR', c_cca_lqr),
-                ('Est CCA ReLU', c_cca_relu),
-                ('Est VAR Committor', c_var_commit)
+            methods = [
+                ("Committor (oracle)",   c_committor),
+                ("LQR (oracle)",         c_lqr_oracle),
+                ("ReLU (oracle)",        c_relu_oracle),
+                ("Committor (wSVD)",     _make_ctrl(erf_feedback if D_test >= 1e-8 else relu_feedback, p_wsvd, p_wsvd['D'])),
+                ("LQR (wSVD)",           _make_ctrl(lqr_feedback, p_wsvd, p_wsvd['D'])),
+                ("ReLU (wSVD)",          _make_ctrl(sign_gated_feedback, p_wsvd, p_wsvd['D'])),
+                ("Committor (VAR)",      _make_ctrl(erf_feedback if D_test >= 1e-8 else relu_feedback, p_var, p_var['D'])),
+                ("ReLU (VAR)",           _make_ctrl(sign_gated_feedback, p_var, p_var['D'])),
             ]
 
-            for method_name, ctrl in methods_config:
-                successes, timeouts, failures, energies = 0, 0, 0, []
+            rng_ic = np.random.default_rng(11)
+            ics = [sys.x_star + rng_ic.uniform(0, a * 0.75) * w_u_norm + rng_ic.uniform(-a * 0.75, a * 0.75) * w_s for _ in range(num_trajs)]
+
+            for method_name, ctrl in methods:
+                successes = 0
+                energies_succ, energies_all = [], []
                 for x0 in ics:
                     run_rng = np.random.default_rng(int(rng_ic.integers(0, 10**6)))
-                    traj, hit_side, energy = simulate_trajectory(x0, T_sim, dt, sys.drift, D_test, ctrl, sys, a, run_rng)
-                    
-                    if hit_side == "timeout": timeouts += 1
-                    elif hit_side == "hit_B": failures += 1
-                    
-                    if hit_side == "reached_A" or (D_test < 1e-8 and hit_side == "timeout"):
-                        successes += 1
-                        energies.append(energy)
-                
-                succ_rate = successes / num_trajs
-                to_rate = timeouts / num_trajs
-                fail_rate = failures / num_trajs
-                mean_energy = np.mean(energies) if energies else 0.0
-                std_energy = np.std(energies) if energies else 0.0
-                writer.writerow([sys.name, method_name, D_test, succ_rate, to_rate, fail_rate, mean_energy, std_energy])
-                print(f"  {method_name:<20} | D={D_test:.4f} | SR={succ_rate:.2f} | TO={to_rate:.2f} | Fail={fail_rate:.2f} | E={mean_energy:.3f}")
+                    _, hit_side, energy = simulate_trajectory(x0, T_sim, dt, sys.drift, D_test, ctrl, sys, a, run_rng)
+                    energies_all.append(energy)
+                    if hit_side == "reached_A": successes += 1; energies_succ.append(energy)
+                sr = successes / num_trajs
+                me_s = np.mean(energies_succ) if energies_succ else 0.0
+                se_s = np.std(energies_succ) if energies_succ else 0.0
+                me_a = np.mean(energies_all) if energies_all else 0.0
+                se_a = np.std(energies_all) if energies_all else 0.0
+                writer.writerow([sys.name, method_name, D_test, sr, num_trajs,
+                                 me_s, se_s, len(energies_succ), me_a, se_a, len(energies_all)])
+                print(f"    D={D_test:.4f} | {method_name:<22} | SR={sr:.3f} | E_s={me_s:.3f} | E_a={me_a:.3f}")
+    print(f"  Saved -> {csv_filepath}")
 
-def plot_baseline_comparison(csv_filepath="figures/baselines.csv", filepath="figures/baseline_comparison.pdf"):
-    """Plots Success Rate and Mean Control Energy for the baseline comparisons."""
+def plot_baseline_comparison(csv_filepath, sys_name, filepath,
+                            show_spread=True,
+                            ylim_sr=(-0.05, 1.05), ylim_energy=None,
+                            figsize=(6.5, 6.0),
+                            label_fontsize=11, legend_fontsize=7.5):
+    """Baseline comparison: color-by-metric, markers/linestyles encode method."""
     set_ieee_style()
-    if not os.path.exists(csv_filepath): 
-        print(f" [!] Data file {csv_filepath} not found.")
-        return
-        
+    data = _read_sweep_csv(csv_filepath, sys_name)
+    if not data: print(f"     [ERROR] No data in {csv_filepath}"); return
+
+    noises = sorted(set(d['Noise_D'] for d in data))
+    pseudo_zero, map_x, non_zero = _make_log_axis(noises)
+    methods_in_data = list(dict.fromkeys(d['Method'] for d in data))
+
+    fig, (ax_sr, ax_en) = plt.subplots(2, 1, figsize=figsize, sharex=True)
+    fig.subplots_adjust(hspace=0.08)
+    legend_handles = []
+
+    for method in methods_in_data:
+        sty = _get_method_style(method)
+        xs, sr_vals, en_vals, sem_vals = [], [], [], []
+        for n in noises:
+            row = next((r for r in data if r['Noise_D'] == n and r['Method'] == method), None)
+            if not row: continue
+            ns = row.get('N_Success', 0)
+            sem = row['Std_Energy_Succ'] / np.sqrt(max(ns, 1)) if ns > 0 else 0.0
+            xs.append(map_x(n)); sr_vals.append(row['Success_Rate'])
+            en_vals.append(row['Mean_Energy_Succ']); sem_vals.append(sem)
+        if not xs: continue
+
+        ax_sr.plot(xs, sr_vals, marker=sty['marker'], color=C_SUCCESS, ls=sty['ls'],
+                   lw=sty['lw'], markersize=5)
+        en_a, sem_a = np.array(en_vals), np.array(sem_vals)
+        ax_en.plot(xs, en_a, marker=sty['marker'], color=C_ENERGY, ls=sty['ls'],
+                   lw=sty['lw'], markersize=5)
+        if show_spread and np.any(sem_a > 0):
+            ax_en.fill_between(xs, np.maximum(0, en_a - 1.96*sem_a), en_a + 1.96*sem_a, color=C_ENERGY, alpha=0.06)
+        legend_handles.append(Line2D([], [], color='#333', marker=sty['marker'], ls=sty['ls'],
+                                     lw=sty['lw'], markersize=5, label=sty['label']))
+
+    ax_sr.set_ylim(ylim_sr)
+    ax_sr.set_ylabel("Success rate", fontsize=label_fontsize, color=C_SUCCESS)
+    ax_sr.tick_params(axis='y', colors=C_SUCCESS)
+    ax_sr.legend(handles=legend_handles, loc='lower left', fontsize=legend_fontsize, ncol=2, framealpha=0.9)
+    if ylim_energy: ax_en.set_ylim(ylim_energy)
+    ax_en.set_ylabel("Mean control energy", fontsize=label_fontsize, color=C_ENERGY)
+    ax_en.tick_params(axis='y', colors=C_ENERGY)
+    ax_en.set_xscale('log'); ax_en.set_xticks([map_x(n) for n in noises])
+    ax_en.set_xticklabels(['0' if n == 0.0 else f"{n:.3g}" for n in noises], rotation=45, ha='right')
+    ax_en.set_xlabel("Noise strength ($D$)", fontsize=label_fontsize)
+    if non_zero:
+        for ax in (ax_sr, ax_en): ax.axvline(x=pseudo_zero*1.5, color='gray', ls=':', alpha=0.4, lw=0.6)
+    fig.align_ylabels([ax_sr, ax_en])
+    _save_fig(fig, filepath)
+
+def run_trust_region_ablation(sys, a=0.5, D_eval=0.01, dt=0.01, num_trajs=500, T_sim=2000,
+                               T_train=2500, tau=10, r_neigh_values=None,
+                               csv_filepath="figures/trust_region_ablation.csv"):
+    """Ablation over trust-region radius r_neigh."""
+    if r_neigh_values is None: r_neigh_values = [0.25, 0.5, 1.0, 2.0, np.inf]
+    w_u_norm = sys.w_u_true / np.linalg.norm(sys.w_u_true)
+    w_s = np.random.default_rng(42).standard_normal(sys.x_star.size)
+    w_s -= np.dot(w_s, w_u_norm) * w_u_norm; w_s /= np.linalg.norm(w_s) + 1e-15
+    D_train = max(D_eval, 0.005)
+    os.makedirs(os.path.dirname(csv_filepath), exist_ok=True)
+    print(f"\n  Trust-region ablation: {sys.name}")
+    with open(csv_filepath, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["System", "R_neigh", "Cos_Sim", "Lambda_u_hat", "D_hat", "Success_Rate", "Mean_Energy", "Std_Energy", "N_Success"])
+        rng_ic = np.random.default_rng(11)
+        ics = [sys.x_star + rng_ic.uniform(0, a * 0.75) * w_u_norm + rng_ic.uniform(-a * 0.75, a * 0.75) * w_s for _ in range(num_trajs)]
+        for rn in r_neigh_values:
+            alg = CCATracker(dim=sys.x_star.size, dt=dt, tau=tau, rng_seed=0, use_whitened=True)
+            alg.train(sys.drift, T_train, dt, D_train, 0, a, sys.w_u_true, init_center=sys.x_star, r_neigh=rn)
+            p = alg.get_params(sys.w_u_true)
+            cos_sim = abs(float(np.dot(p['w_u'], sys.w_u_true)))
+            kw = dict(a=a, r_neigh=rn)
+            if D_eval < 1e-8: ctrl = partial(relu_feedback, w_u=p['w_u'], lambda_u=p['lambda_u'], D=D_eval, x_fp=p['x_star'], **kw)
+            else: ctrl = partial(erf_feedback, w_u=p['w_u'], lambda_u=p['lambda_u'], D=p['D'], x_fp=p['x_star'], **kw)
+            successes, energies = 0, []
+            for x0 in ics:
+                run_rng = np.random.default_rng(int(rng_ic.integers(0, 10**6)))
+                _, hit_side, energy = simulate_trajectory(x0, T_sim, dt, sys.drift, D_eval, ctrl, sys, a, run_rng)
+                if hit_side == "reached_A": successes += 1; energies.append(energy)
+            sr = successes / num_trajs; me = np.mean(energies) if energies else 0.0; se = np.std(energies) if energies else 0.0
+            rn_str = f"{rn:.2f}" if rn < np.inf else "inf"
+            writer.writerow([sys.name, rn_str, cos_sim, p['lambda_u'], p['D'], sr, me, se, len(energies)])
+            print(f"    r_neigh={rn_str:>6} | cos={cos_sim:.4f} | lam={p['lambda_u']:.3f} | D={p['D']:.5f} | SR={sr:.3f} | E={me:.3f}")
+    print(f"  Saved -> {csv_filepath}")
+
+def run_hyperparameter_ablation(sys, a=0.5, r_neigh=np.inf, D_eval=0.01, dt=0.01,
+                                 num_trajs=500, T_sim=2000, T_train=2500,
+                                 tau_values=None, gamma_values=None,
+                                 csv_filepath="figures/hyperparam_ablation.csv"):
+    """Ablation over lag tau and EMA discount gamma."""
+    if tau_values is None: tau_values = [1, 5, 10, 20, 50]
+    if gamma_values is None: gamma_values = [0.001, 0.005, 0.01, 0.05, 0.1]
+    w_u_norm = sys.w_u_true / np.linalg.norm(sys.w_u_true)
+    w_s = np.random.default_rng(42).standard_normal(sys.x_star.size)
+    w_s -= np.dot(w_s, w_u_norm) * w_u_norm; w_s /= np.linalg.norm(w_s) + 1e-15
+    D_train = max(D_eval, 0.005)
+    os.makedirs(os.path.dirname(csv_filepath), exist_ok=True)
+    print(f"\n  Hyperparameter ablation: {sys.name}")
+    with open(csv_filepath, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["System", "Tau", "Gamma", "Cos_Sim", "Lambda_u_hat", "D_hat", "Success_Rate", "Mean_Energy"])
+        rng_ic = np.random.default_rng(11)
+        ics = [sys.x_star + rng_ic.uniform(0, a * 0.75) * w_u_norm + rng_ic.uniform(-a * 0.75, a * 0.75) * w_s for _ in range(num_trajs)]
+        default_gamma = 0.01; default_tau = 10
+        # Sweep tau with fixed gamma
+        for tau_val in tau_values:
+            alg = CCATracker(dim=sys.x_star.size, dt=dt, tau=tau_val, rng_seed=0, use_whitened=True)
+            alg.train(sys.drift, T_train, dt, D_train, 0, a, sys.w_u_true, init_center=sys.x_star, r_neigh=r_neigh)
+            p = alg.get_params(sys.w_u_true)
+            cos_sim = abs(float(np.dot(p['w_u'], sys.w_u_true)))
+            kw = dict(a=a, r_neigh=r_neigh)
+            ctrl = partial(erf_feedback, w_u=p['w_u'], lambda_u=p['lambda_u'], D=p['D'], x_fp=p['x_star'], **kw)
+            successes, energies = 0, []
+            for x0 in ics:
+                run_rng = np.random.default_rng(int(rng_ic.integers(0, 10**6)))
+                _, hit_side, energy = simulate_trajectory(x0, T_sim, dt, sys.drift, D_eval, ctrl, sys, a, run_rng)
+                if hit_side == "reached_A": successes += 1; energies.append(energy)
+            sr = successes / num_trajs; me = np.mean(energies) if energies else 0.0
+            writer.writerow([sys.name, tau_val, default_gamma, cos_sim, p['lambda_u'], p['D'], sr, me])
+            print(f"    tau={tau_val:3}, gamma={default_gamma:.3f} | cos={cos_sim:.4f} | lam={p['lambda_u']:.3f} | SR={sr:.3f}")
+        # Sweep gamma with fixed tau (using OnlineCCATracker)
+        for gamma_val in gamma_values:
+            alg = OnlineCCATracker(dim=sys.x_star.size, dt=dt, gamma=gamma_val, tau=default_tau, min_steps=20, a=a, rng_seed=0, use_whitened=True)
+            alg.train(sys.drift, T_train, dt, D_train, 0, sys.w_u_true, sys.x_star, r_neigh=r_neigh)
+            p = alg.get_params(sys.w_u_true)
+            cos_sim = abs(float(np.dot(p['w_u'], sys.w_u_true)))
+            kw = dict(a=a, r_neigh=r_neigh)
+            ctrl = partial(erf_feedback, w_u=p['w_u'], lambda_u=p['lambda_u'], D=p['D'], x_fp=p['x_star'], **kw)
+            successes, energies = 0, []
+            for x0 in ics:
+                run_rng = np.random.default_rng(int(rng_ic.integers(0, 10**6)))
+                _, hit_side, energy = simulate_trajectory(x0, T_sim, dt, sys.drift, D_eval, ctrl, sys, a, run_rng)
+                if hit_side == "reached_A": successes += 1; energies.append(energy)
+            sr = successes / num_trajs; me = np.mean(energies) if energies else 0.0
+            writer.writerow([sys.name, default_tau, gamma_val, cos_sim, p['lambda_u'], p['D'], sr, me])
+            print(f"    tau={default_tau:3}, gamma={gamma_val:.3f} | cos={cos_sim:.4f} | lam={p['lambda_u']:.3f} | SR={sr:.3f}")
+    print(f"  Saved -> {csv_filepath}")
+
+def plot_trust_region_ablation(csv_filepath, sys_name, filepath, label_fontsize=11, legend_fontsize=9):
+    """Plot trust-region ablation: parameter quality and success rate vs r_neigh."""
+    set_ieee_style()
+    if not os.path.exists(csv_filepath): return
     data = []
     with open(csv_filepath, 'r') as f:
         reader = csv.DictReader(f)
-        for row in reader: 
-            data.append({
-                'Method': row['Method'], 
-                'Noise_D': float(row['Noise_D']), 
-                'Success_Rate': float(row['Success_Rate']),
-                'Mean_Energy': float(row['Mean_Energy']),
-                'Std_Energy': float(row.get('Std_Energy', 0.0))
-            })
-            
-    noises = sorted(list(set(d['Noise_D'] for d in data)))
-    non_zero_noises = [n for n in noises if n > 0]
-    pseudo_zero = min(non_zero_noises) / 3.0 if non_zero_noises else 0.0001
-    def map_x(n): return pseudo_zero if n == 0.0 else n
+        for row in reader:
+            if row['System'] == sys_name:
+                data.append({k: row[k] for k in row})
+    if not data: return
+    rns = [d['R_neigh'] for d in data]
+    cos_vals = [float(d['Cos_Sim']) for d in data]
+    lam_vals = [float(d['Lambda_u_hat']) for d in data]
+    sr_vals = [float(d['Success_Rate']) for d in data]
+    en_vals = [float(d['Mean_Energy']) for d in data]
+    x = np.arange(len(rns))
 
-    # Create a 2-panel stacked plot
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(6.5, 6.5), sharex=True)
-    fig.subplots_adjust(hspace=0.1)
-    
-    colors = {
-        "Oracle Committor": "#1a6faf", 
-        "Oracle LQR": "#ff7f0e", 
-        "Oracle ReLU": "#2ca02c", 
-        "Est CCA Committor": "#005f38", 
-        "Est CCA LQR": "#e377c2",
-        "Est CCA ReLU": "#8c564b",
-        "Est VAR Committor": "#d62728"
-    }
-    markers = {
-        "Oracle Committor": "s", "Oracle LQR": "v", "Oracle ReLU": "^", 
-        "Est CCA Committor": "o", "Est CCA LQR": "p", "Est CCA ReLU": "*", "Est VAR Committor": "D"
-    }
-    linestyles = {
-        "Oracle Committor": "-", "Oracle LQR": ":", "Oracle ReLU": "--", 
-        "Est CCA Committor": "-", "Est CCA LQR": ":", "Est CCA ReLU": "--", "Est VAR Committor": "-."
-    }
-    
-    for method in colors.keys():
-        xs_zero, ys_sr_zero, ys_en_zero, sem_en_zero = [], [], [], []
-        xs_pos, ys_sr_pos, ys_en_pos, sem_en_pos = [], [], [], []
-        
-        for n in noises:
-            row = next((r for r in data if r['Method'] == method and r['Noise_D'] == n), None)
-            if row:
-                # Approximate SEM (Assuming 100 trajectories per condition as set in the script)
-                sem = row['Std_Energy'] / np.sqrt(100)
-                if n == 0.0: 
-                    xs_zero.append(map_x(n))
-                    ys_sr_zero.append(row['Success_Rate'])
-                    ys_en_zero.append(row['Mean_Energy'])
-                    sem_en_zero.append(sem)
-                else: 
-                    xs_pos.append(map_x(n))
-                    ys_sr_pos.append(row['Success_Rate'])
-                    ys_en_pos.append(row['Mean_Energy'])
-                    sem_en_pos.append(sem)
-                    
-        col, mrk, ls = colors[method], markers[method], linestyles[method]
-        
-        # --- TOP PANEL: Success Rate ---
-        if xs_zero: ax1.plot(xs_zero, ys_sr_zero, marker=mrk, color=col, ls='none', lw=1.5, markersize=6)
-        if xs_pos: ax1.plot(xs_pos, ys_sr_pos, marker=mrk, color=col, ls=ls, lw=1.5, markersize=6, label=method)
-        
-        # --- BOTTOM PANEL: Control Energy ---
-        if xs_zero: 
-            ax2.plot(xs_zero, ys_en_zero, marker=mrk, color=col, ls='none', lw=1.5, markersize=6)
-            # Add subtle error bars for zero noise if energy > 0
-            if any(e > 0 for e in ys_en_zero):
-                ax2.errorbar(xs_zero, ys_en_zero, yerr=1.96*np.array(sem_en_zero), color=col, fmt='none', alpha=0.5)
+    fig, axes = plt.subplots(2, 2, figsize=(8, 5)); fig.subplots_adjust(hspace=0.35, wspace=0.35)
+    axes[0, 0].bar(x, cos_vals, color='#2d307b', alpha=0.8); axes[0, 0].set_xticks(x); axes[0, 0].set_xticklabels(rns, rotation=45)
+    axes[0, 0].set_ylabel(r"$|\cos(\hat{w}_u, w_u)|$"); axes[0, 0].set_ylim(0.5, 1.05); axes[0, 0].set_xlabel(r"$r_{\mathrm{neigh}}$")
+    axes[0, 1].bar(x, lam_vals, color='#19421e', alpha=0.8); axes[0, 1].set_xticks(x); axes[0, 1].set_xticklabels(rns, rotation=45)
+    axes[0, 1].axhline(y=2.0, color='gray', ls='--', lw=1); axes[0, 1].set_ylabel(r"$\hat{\lambda}_u$"); axes[0, 1].set_xlabel(r"$r_{\mathrm{neigh}}$")
+    axes[1, 0].bar(x, sr_vals, color='#1a6faf', alpha=0.8); axes[1, 0].set_xticks(x); axes[1, 0].set_xticklabels(rns, rotation=45)
+    axes[1, 0].set_ylabel("Success rate"); axes[1, 0].set_ylim(0, 1.05); axes[1, 0].set_xlabel(r"$r_{\mathrm{neigh}}$")
+    axes[1, 1].bar(x, en_vals, color='#a01b2a', alpha=0.8); axes[1, 1].set_xticks(x); axes[1, 1].set_xticklabels(rns, rotation=45)
+    axes[1, 1].set_ylabel("Mean energy"); axes[1, 1].set_xlabel(r"$r_{\mathrm{neigh}}$")
+    fig.savefig(filepath, bbox_inches="tight"); fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight")
+    print(f"     Saved trust-region ablation -> {filepath}"); plt.close(fig)
 
-        if xs_pos: 
-            ax2.plot(xs_pos, ys_en_pos, marker=mrk, color=col, ls=ls, lw=1.5, markersize=6)
-            # Add SEM shading for energy
-            ys_en_pos_arr = np.array(ys_en_pos)
-            sem_en_pos_arr = np.array(sem_en_pos)
-            ax2.fill_between(xs_pos, ys_en_pos_arr - 1.96*sem_en_pos_arr, ys_en_pos_arr + 1.96*sem_en_pos_arr, color=col, alpha=0.15)
-        
-    # Formatting Top Panel (Success Rate)
-    ax1.set_ylim(-0.05, 1.05)
-    ax1.set_ylabel("Success rate", fontsize=10)
-    ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9, framealpha=0.95)
-    ax1.grid(True, linestyle='-', alpha=0.3, color='gray')
-    
-    # Formatting Bottom Panel (Mean Energy)
-    ax2.set_xscale('log')
-    ax2.set_xticks([map_x(n) for n in noises])
-    ax2.set_xticklabels(['0' if n == 0.0 else f"{n:.3g}" for n in noises], rotation=45, ha='right')
-    ax2.set_ylabel("Mean control energy", fontsize=10)
-    ax2.set_xlabel("Noise strength ($D$)", fontsize=10)
-    ax2.grid(True, linestyle='-', alpha=0.3, color='gray')
-    
-    if non_zero_noises: 
-        ax1.axvline(x=pseudo_zero * 1.5, color='gray', linestyle=':', alpha=0.5)
-        ax2.axvline(x=pseudo_zero * 1.5, color='gray', linestyle=':', alpha=0.5)
-    
-    fig.align_ylabels([ax1, ax2])
-    fig.tight_layout()
-    fig.savefig(filepath, bbox_inches="tight")
-    fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight")
-    print(f" Saved 2-Panel Baseline Plot -> {filepath}")
-    plt.close(fig)
-
-
-
-def run_gating_weighting_ablation(sys, a=0.5, r_neigh=np.inf, dt=0.01, D_eval=0.01, num_trajs=100, T_sim=2000, T_train=2500, csv_filepath="figures/ablation_gating_weighting.csv"):
-    """
-    Isolates the practical weakness of discrete-time tracking bias far from the saddle.
-    Compares:
-      1. No gating
-      2. Coordinate gating by estimated |x_u| and |x_s|
-      3. Weighted estimation (Gaussian kernel modulating gamma near saddle)
-    Tracks changes in \hat\lambda_u, success rate, and control energy.
-    """
-    print(f"\n -> Running Gating & Weighting Ablation for {sys.name} at D={D_eval}...")
-    os.makedirs(os.path.dirname(csv_filepath), exist_ok=True)
-    
-    # Use the standardized IC generator with safe bounds to prevent sudden death
-    ics, rng_ic = generate_initial_conditions(sys, a, num_trajs, seed=11, u_min_frac=0.02, u_max_frac=0.5, s_spread_frac=0.5)
-
-    conditions = [
-        {"name": "No Gating", "type": "none", "xu": np.inf, "xs": np.inf, "sigma": np.inf},
-        # Widen the gating bounds so ICs don't instantly trip the learning cutoff.
-        {"name": "Coordinate Gating", "type": "coordinate", "xu": a * 0.98, "xs": a * 1.5, "sigma": np.inf},
-        {"name": "Weighted Estimation", "type": "weighting", "xu": np.inf, "xs": np.inf, "sigma": 0.4}
-    ]
-
-    with open(csv_filepath, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(["System", "Condition", "Success_Rate", "Timeout_Rate", "Fail_Rate", "Mean_Energy", "Mean_Lambda_u"])
-        
-        for cond in conditions:
-            base_gamma = 0.01
-            tracker = OnlineCCATracker(dim=sys.x_star.size, dt=dt, gamma=base_gamma, tau=10, min_steps=20, a=a, rng_seed=0, use_whitened=True)
-            
-            # Pre-train locally passing the specific r_neigh for the system
-            tracker.train(sys.drift, T_train, dt, D_eval, 0, sys.w_u_true, sys.x_star, r_neigh=r_neigh)
-            
-            successes, timeouts, failures, energies, lambda_estimates = 0, 0, 0, [], []
-            
-            for x0 in ics:
-                run_rng = np.random.default_rng(int(rng_ic.integers(0, 10**6)))
-                tr_copy = copy.deepcopy(tracker)
-                x = x0.copy()
-                energy = 0.0
-                hit_side = "timeout"
-                
-                for t in range(T_sim):
-                    x_u_true = float(np.dot(sys.w_u_true, x - sys.x_star))
-                    if x_u_true >= a: hit_side = "hit_B"; break
-                    if x_u_true <= -a: hit_side = "reached_A"; break
-                    
-                    params = tr_copy.get_params(sign_ref=sys.w_u_true)
-                    
-                    # 1. ALWAYS COMPUTE CONTROL (Never turn off the engines on an unstable saddle!)
-                    if D_eval < 1e-8:
-                        u_ideal = relu_feedback(x, params['w_u'], params['lambda_u'], D_eval, params['x_star'], a, np.inf)
-                    else:
-                        u_ideal = erf_feedback(x, params['w_u'], params['lambda_u'], params['D'], params['x_star'], a, np.inf)
-
-                    u_applied = np.clip(u_ideal, -50.0, 50.0)
-                    energy += np.sum(u_applied**2) * dt
-                    
-                    # 2. Environment Step
-                    drift_val = sys.drift(t * dt, x)
-                    noise_val = np.sqrt(2.0 * D_eval) * run_rng.standard_normal(len(x)) * np.sqrt(dt) if D_eval > 0 else 0.0
-                    x_next = x + (drift_val + u_applied) * dt + noise_val
-                    x_next_pseudo = x_next - u_applied * dt
-                    
-                    # 3. Check Trust Region for LEARNING ONLY
-                    in_trust_region = True
-                    if cond["type"] == "coordinate":
-                        dx = x - params['x_star']
-                        x_u_mag = abs(float(np.dot(params['w_u'], dx)))
-                        x_s_mag = np.linalg.norm(dx - float(np.dot(params['w_u'], dx)) * params['w_u'])
-                        in_trust_region = (x_u_mag <= cond["xu"]) and (x_s_mag <= cond["xs"])
-
-                    # 4. Tracker Update (Gate the data, not the physics)
-                    if in_trust_region:
-                        if cond["type"] == "weighting":
-                            dist_sq = np.sum((x - params['x_star'])**2)
-                            weight = np.exp(-dist_sq / (2.0 * cond["sigma"]**2))
-                            tr_copy.gamma = base_gamma * weight
-                        else:
-                            tr_copy.gamma = base_gamma
-                            
-                        tr_copy.update(x, x_next_pseudo, sys.w_u_true)
-                    else:
-                        if cond["type"] == "coordinate":
-                            tr_copy.reset() # Flush short-term memory so it doesn't get poisoned
-                        
-                    x = x_next
-                
-                # Log outcomes
-                if hit_side == "timeout": timeouts += 1
-                elif hit_side == "hit_B": failures += 1
-                
-                if hit_side == "reached_A" or (D_eval < 1e-8 and hit_side == "timeout"):
-                    successes += 1
-                    energies.append(energy)
-                    lambda_estimates.append(tr_copy.lambda_u)
-            
-            succ_rate = successes / num_trajs
-            to_rate = timeouts / num_trajs
-            fail_rate = failures / num_trajs
-            mean_energy = np.mean(energies) if energies else 0.0
-            mean_lambda = np.mean(lambda_estimates) if lambda_estimates else 0.0
-            
-            writer.writerow([sys.name, cond["name"], succ_rate, to_rate, fail_rate, mean_energy, mean_lambda])
-            print(f"  {cond['name']:<20} | SR={succ_rate:.2f} | Fail={fail_rate:.2f} | E={mean_energy:.3f} | Lam_u_est={mean_lambda:.3f} (True={sys.lambda_u_true:.3f})")
-
-            
-def run_hyperparameter_ablation(sys, a=0.5, dt=0.01, D_eval=0.01, num_trajs=100, T_sim=2000, T_train=2500, csv_filepath="figures/ablation_hyperparameters.csv"):
-    """
-    Evaluates robustness to the central hyperparameters in Algorithm 1 using a FULL GRID search.
-    """
-    print(f"\n -> Running Full Grid Hyperparameter Ablation for {sys.name}...")
-    os.makedirs(os.path.dirname(csv_filepath), exist_ok=True)
-    
-    w_u_norm = sys.w_u_true / np.linalg.norm(sys.w_u_true)
-    w_s = np.random.default_rng(42).standard_normal(sys.x_star.size)
-    w_s -= np.dot(w_s, w_u_norm) * w_u_norm
-    w_s /= np.linalg.norm(w_s) + 1e-15
-    rng_ic = np.random.default_rng(11)
-    
-    ics, rng_ic = generate_initial_conditions(sys, a, num_trajs)
-
-    tau_list = [1, 5, 10, 20]
-    gamma_list = [0.001, 0.01, 0.05, 0.1]
-
-    with open(csv_filepath, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(["System", "Tau", "Gamma", "Success_Rate", "Fail_Rate", "Mean_Energy"])
-        
-        # FULL GRID SWEEP
-        for tau in tau_list:
-            for gamma in gamma_list:
-                tracker = OnlineCCATracker(dim=sys.x_star.size, dt=dt, gamma=gamma, tau=tau, min_steps=20, a=a, rng_seed=0, use_whitened=True)
-                tracker.train(sys.drift, T_train, dt, D_eval, 0, sys.w_u_true, sys.x_star, r_neigh=a)
-                
-                successes, failures, energies = 0, 0, []
-                for x0 in ics:
-                    run_rng = np.random.default_rng(int(rng_ic.integers(0, 10**6)))
-                    tr_copy = copy.deepcopy(tracker)
-                    traj, hit_side, energy = simulate_adaptive_trajectory(x0, T_sim, dt, sys.drift, D_eval, tr_copy, sys, a, np.inf, None, run_rng, is_adaptive=True)
-                    
-                    if hit_side == "hit_B": failures += 1
-                    if hit_side == "reached_A" or (D_eval < 1e-8 and hit_side == "timeout"):
-                        successes += 1; energies.append(energy)
-                
-                sr, fr, me = successes/num_trajs, failures/num_trajs, np.mean(energies) if energies else 0.0
-                writer.writerow([sys.name, tau, gamma, sr, fr, me])
-                print(f"  Tau={tau:<3} | Gamma={gamma:<5} | SR={sr:.2f} | Fail={fr:.2f} | E={me:.3f}")
-
-
-def plot_gating_weighting_ablation(csv_filepath, true_lambda=2.0, filepath="figures/ablation_fixes.pdf"):
-    """Plots the results of the gating/weighting ablation: Success Rate and Eigenvalue Bias."""
+def plot_hyperparameter_ablation(csv_filepath, sys_name, filepath, true_lambda=2.0, label_fontsize=11):
+    """Plot hyperparameter ablation: tau sweep and gamma sweep."""
     set_ieee_style()
     if not os.path.exists(csv_filepath): return
-    
-    conditions, sr, lam = [], [], []
+    data = []
     with open(csv_filepath, 'r') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            # Shorten names for the plot labels
-            cond = row['Condition'].replace(" Estimation", "").replace(" Gating", "")
-            conditions.append(cond)
-            sr.append(float(row['Success_Rate']))
-            lam.append(float(row['Mean_Lambda_u']))
-            
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.0, 3.5))
-    
-    # Left Panel: Success Rate
-    ax1.bar(conditions, sr, color="#2d307b", alpha=0.8, width=0.5, edgecolor="black", linewidth=1.2)
-    ax1.set_ylim(0, 1.05)
-    ax1.set_ylabel("Success Rate", fontsize=10)
-    ax1.set_xticklabels(conditions, rotation=20, ha="right", fontsize=9)
-    ax1.grid(True, axis='y', linestyle='--', alpha=0.5)
-    ax1.set_title("Tracking Robustness", fontsize=11)
+            if row['System'] == sys_name: data.append({k: row[k] for k in row})
+    if not data: return
+    # Split tau sweep vs gamma sweep
+    tau_data = [d for d in data if float(d['Gamma']) == 0.01]
+    gam_data = [d for d in data if int(d['Tau']) == 10]
 
-    # Right Panel: Eigenvalue Estimation Bias
-    ax2.bar(conditions, lam, color="#005f38", alpha=0.8, width=0.5, edgecolor="black", linewidth=1.2)
-    ax2.axhline(true_lambda, color="#ed2024", linestyle="--", linewidth=2.0, label="True $\lambda_u$")
-    ax2.set_ylabel("Estimated $\hat{\lambda}_u$", fontsize=10)
-    ax2.set_xticklabels(conditions, rotation=20, ha="right", fontsize=9)
-    ax2.legend(loc="upper left")
-    ax2.grid(True, axis='y', linestyle='--', alpha=0.5)
-    ax2.set_title("Estimation Bias Far From Saddle", fontsize=11)
-
-    fig.tight_layout()
-    fig.savefig(filepath, bbox_inches="tight")
-    fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved Gating/Weighting Ablation Plot -> {filepath}")
-
-def plot_hyperparameter_ablation(csv_filepath, filepath="figures/ablation_hyperparameters.pdf"):
-    """Plots the Success Rate as a 2D Heatmap over Tau and Gamma."""
-    import seaborn as sns
-    import pandas as pd
-    set_ieee_style()
-    if not os.path.exists(csv_filepath): return
-    
-    # Load data into pandas for easy pivoting
-    df = pd.read_csv(csv_filepath)
-    
-    # Create a pivot table: Rows = Tau, Cols = Gamma, Values = Success Rate
-    pivot_sr = df.pivot(index="Tau", columns="Gamma", values="Success_Rate")
-    
-    # Sort index so larger Tau is at the top or bottom depending on preference
-    pivot_sr = pivot_sr.sort_index(ascending=False) 
-
-    fig, ax = plt.subplots(figsize=(5.5, 4.0))
-    
-    # Draw heatmap
-    sns.heatmap(pivot_sr, annot=True, fmt=".2f", cmap="YlGnBu", 
-                vmin=0, vmax=1, cbar_kws={'label': 'Success Rate'}, ax=ax)
-    
-    ax.set_title(r"Success Rate Robustness ($\tau$ vs $\gamma$)", fontsize=11, pad=10)
-    ax.set_ylabel("Lag Window ($\\tau$)", fontsize=10)
-    ax.set_xlabel("EMA Discount ($\\gamma$)", fontsize=10)
-    
-    fig.tight_layout()
-    fig.savefig(filepath, bbox_inches="tight")
-    fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved Hyperparameter Heatmap -> {filepath}")
+    fig, axes = plt.subplots(2, 2, figsize=(8, 5)); fig.subplots_adjust(hspace=0.4, wspace=0.35)
+    # Tau sweep
+    if tau_data:
+        taus = [int(d['Tau']) for d in tau_data]
+        ax = axes[0, 0]; ax.plot(taus, [float(d['Cos_Sim']) for d in tau_data], 'o-', color='#2d307b')
+        ax.set_xlabel(r"$\tau$"); ax.set_ylabel(r"$|\cos(\hat{w}_u, w_u)|$"); ax.set_ylim(0.5, 1.05)
+        ax = axes[0, 1]; ax.plot(taus, [float(d['Success_Rate']) for d in tau_data], 's-', color='#1a6faf')
+        ax.set_xlabel(r"$\tau$"); ax.set_ylabel("Success rate"); ax.set_ylim(0, 1.05)
+    # Gamma sweep
+    if gam_data:
+        gammas = [float(d['Gamma']) for d in gam_data]
+        ax = axes[1, 0]; ax.plot(gammas, [float(d['Cos_Sim']) for d in gam_data], 'o-', color='#2d307b')
+        ax.set_xlabel(r"$\gamma$"); ax.set_ylabel(r"$|\cos(\hat{w}_u, w_u)|$"); ax.set_xscale('log'); ax.set_ylim(0.5, 1.05)
+        ax = axes[1, 1]; ax.plot(gammas, [float(d['Success_Rate']) for d in gam_data], 's-', color='#1a6faf')
+        ax.set_xlabel(r"$\gamma$"); ax.set_ylabel("Success rate"); ax.set_xscale('log'); ax.set_ylim(0, 1.05)
+    fig.savefig(filepath, bbox_inches="tight"); fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight")
+    print(f"     Saved hyperparam ablation -> {filepath}"); plt.close(fig)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 9. MAIN EXECUTION SCRIPT
+# MAIN EXECUTION SCRIPT
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1763,6 +1676,7 @@ if __name__ == "__main__":
 
     # ══════════════════════════════════════════════════════════════════════
     # FIGURE 1: Single trajectory examples (all 3 systems)
+    #   Autonomous / Data-enabled (open-loop) / Closed-loop (adaptive)
     # ══════════════════════════════════════════════════════════════════════
     print("\n" + "#"*80 + "\n FIGURE 1: Trajectory examples\n" + "#"*80)
     traj_methods = ["Autonomous", "CCA (Whitened)", "CCA (Adaptive)"]
@@ -1774,28 +1688,29 @@ if __name__ == "__main__":
 
     # ══════════════════════════════════════════════════════════════════════
     # FIGURE 2: Linear system diagnostics
+    #   2a. Parameter convergence
+    #   2b. Noise sweep (success + energy vs D)
+    #   2c. Dimensionality & lambda scaling
+    #   2d. Combined scaling + energy
     # ══════════════════════════════════════════════════════════════════════
     print("\n" + "#"*80 + "\n FIGURE 2: Linear diagnostics\n" + "#"*80)
-    sys_lin2d, a_lin, r_neigh_lin, tau_lin, D_eval_lin = systems["linear_2d"]
+    sys, a, r_neigh, tau, D_eval = systems["linear_2d"]
 
     # 2a. Convergence
     conv_csv = "figures/linear_2d_convergence.csv"
-    generate_convergence_data(sys_lin2d, a=a_lin, D_train=D_eval_lin, dt=dt, T_train=500,
-                              r_neigh=r_neigh_lin, num_trajs=100, tau=tau_lin,
+    generate_convergence_data(sys, a=a, D_train=D_eval, dt=dt, T_train=500,
+                              r_neigh=r_neigh, num_trajs=num_trajs, tau=tau,
                               use_whitened=use_whitened, csv_filepath=conv_csv)
-    plot_convergence_from_data(csv_filepath=conv_csv, sys_lambda_true=sys_lin2d.lambda_u_true,
-                               sys_D_true=D_eval_lin, filepath="figures/linear_2d_convergence_stacked.pdf",
+    plot_convergence_from_data(csv_filepath=conv_csv, sys_lambda_true=sys.lambda_u_true,
+                               sys_D_true=D_eval, filepath="figures/linear_2d_convergence.pdf",
                                layout="stacked", label_fontsize=13, tick_fontsize=12, legend_fontsize=10)
-    plot_convergence_from_data(csv_filepath=conv_csv, sys_lambda_true=sys_lin2d.lambda_u_true,
-                               sys_D_true=D_eval_lin, filepath="figures/linear_2d_convergence_combined.pdf",
-                               layout="combined", label_fontsize=13, tick_fontsize=12, legend_fontsize=10)
 
     # 2b. Noise sweep (D)
     energy_csv = "figures/linear_2d_noise_sweep.csv"
-    simulate_and_save_noise_energy_sweep(sys_lin2d, a=a_lin, dt=dt, r_neigh=r_neigh_lin,
-                                         num_trajs=num_trajs, T_sim=2000, tau=tau_lin,
+    simulate_and_save_noise_energy_sweep(sys, a=a, dt=dt, r_neigh=r_neigh,
+                                         num_trajs=num_trajs, T_sim=2000, tau=tau,
                                          use_whitened=use_whitened, csv_filepath=energy_csv)
-    plot_success_and_energy_vs_noise(csv_filepath=energy_csv, sys_name=sys_lin2d.name,
+    plot_success_and_energy_vs_noise(csv_filepath=energy_csv, sys_name=sys.name,
                                      filepath="figures/linear_2d_noise_sweep.pdf",
                                      layout="stacked", include_adaptive=False)
 
@@ -1803,7 +1718,7 @@ if __name__ == "__main__":
     run_dimensionality_scaling_experiment(dt=dt, num_trajs=num_trajs, T_sim=5000, use_whitened=use_whitened)
 
     # 2d. Combined scaling + energy
-    plot_scaling_and_energy(dim_csv_filepath="figures/dimensionality_scaling_stats_WHITENED_CCA.csv",
+    plot_scaling_and_energy(dim_csv_filepath="figures/dimensionality_scaling_stats.csv",
                             energy_csv_filepath=energy_csv,
                             include_adaptive=False, line_alpha=0.7,
                             filepath="figures/linear_2d_combined_scaling_energy.pdf")
@@ -1813,37 +1728,51 @@ if __name__ == "__main__":
     # ══════════════════════════════════════════════════════════════════════
     print("\n" + "#"*80 + "\n FIGURE 3: Nonlinear noise sweeps\n" + "#"*80)
     for tag in ["double_well", "pendulum"]:
-        sys_nl, a_nl, r_neigh_nl, tau_nl, D_eval_nl = systems[tag]
+        sys, a, r_neigh, tau, D_eval = systems[tag]
         csv_path = f"figures/{tag}_noise_sweep.csv"
-        simulate_and_save_noise_energy_sweep(sys_nl, a=a_nl, dt=dt, r_neigh=r_neigh_nl,
-                                              num_trajs=num_trajs, T_sim=2000, tau=tau_nl,
+        simulate_and_save_noise_energy_sweep(sys, a=a, dt=dt, r_neigh=r_neigh,
+                                              num_trajs=num_trajs, T_sim=2000, tau=tau,
                                               use_whitened=use_whitened, csv_filepath=csv_path)
-        plot_success_and_energy_vs_noise(csv_filepath=csv_path, sys_name=sys_nl.name,
+        plot_success_and_energy_vs_noise(csv_filepath=csv_path, sys_name=sys.name,
                                           filepath=f"figures/{tag}_noise_sweep.pdf",
                                           layout="stacked", include_adaptive=False)
 
     # ══════════════════════════════════════════════════════════════════════
-    # FIGURE 4: Baseline & Ablation Studies 
+    # FIGURE 4: Baseline comparisons (linear + double well)
     # ══════════════════════════════════════════════════════════════════════
-    print("\n" + "#"*80 + "\n FIGURE 4: Baselines & Ablations\n" + "#"*80)
-    
-    # We will test the ablations on the nonlinear Double Well system as requested
-    sys_eval, a_eval, r_neigh_eval, tau_eval, D_eval = systems["double_well"]
-    
-    # 4a. Baselines (LQR vs Sign-Gated vs VAR vs CCA)
-    baseline_csv = f"figures/baselines_{sys_eval.name}.csv"
-    run_baseline_comparison(sys_eval, a=a_eval, r_neigh=r_neigh_eval, dt=dt, num_trajs=100, 
-                            noise_levels=[0.0, 0.005, 0.01, 0.05], csv_filepath=baseline_csv)
-    plot_baseline_comparison(csv_filepath=baseline_csv, filepath=f"figures/baseline_comparison_{sys_eval.name}.pdf")
+    print("\n" + "#"*80 + "\n FIGURE 4: Baseline comparisons\n" + "#"*80)
+    for tag in ["linear_2d", "double_well"]:
+        sys, a, r_neigh, tau, D_eval = systems[tag]
+        csv_path = f"figures/{tag}_baselines.csv"
+        run_baseline_comparison(sys, a=a, r_neigh=r_neigh, D_eval=D_eval, dt=dt,
+                                num_trajs=500, T_sim=2000, T_train=2500, tau=tau,
+                                csv_filepath=csv_path)
+        plot_baseline_comparison(csv_path, sys.name, f"figures/{tag}_baselines.pdf")
 
-    # 4b. The "Fixes" Ablation (Gating & Weighting)
-    run_gating_weighting_ablation(sys_eval, a=a_eval, dt=dt, D_eval=D_eval, num_trajs=100, 
-                                  csv_filepath=f"figures/ablation_fixes_{sys_eval.name}.csv")
-    
-    # 4c. Hyperparameter Robustness (Tau & Gamma)
-    run_hyperparameter_ablation(sys_eval, a=a_eval, dt=dt, D_eval=D_eval, num_trajs=100, 
-                                csv_filepath=f"figures/ablation_hyperparameters_{sys_eval.name}.csv")
+    # ══════════════════════════════════════════════════════════════════════
+    # FIGURE 5: Ablations
+    #   5a. Trust-region radius (double well + pendulum)
+    #   5b. Hyperparameters tau, gamma (linear)
+    # ══════════════════════════════════════════════════════════════════════
+    print("\n" + "#"*80 + "\n FIGURE 5: Ablations\n" + "#"*80)
 
-    print("\n" + "="*80)
-    print(" Execution completed successfully for all systems. Check the 'figures/' directory.")
-    print("="*80)
+    # 5a. Trust-region ablation on nonlinear systems
+    for tag in ["double_well", "pendulum"]:
+        sys, a, r_neigh, tau, D_eval = systems[tag]
+        csv_path = f"figures/{tag}_trust_ablation.csv"
+        run_trust_region_ablation(sys, a=a, D_eval=D_eval, dt=dt, num_trajs=500,
+                                  T_sim=2000, T_train=2500, tau=tau,
+                                  r_neigh_values=[0.25, 0.5, 1.0, 2.0, np.inf],
+                                  csv_filepath=csv_path)
+        plot_trust_region_ablation(csv_path, sys.name, f"figures/{tag}_trust_ablation.pdf")
+
+    # 5b. Hyperparameter ablation on linear system
+    sys, a, r_neigh, tau, D_eval = systems["linear_2d"]
+    csv_path = "figures/linear_2d_hyperparam_ablation.csv"
+    run_hyperparameter_ablation(sys, a=a, r_neigh=r_neigh, D_eval=D_eval, dt=dt,
+                                 num_trajs=500, T_sim=2000, T_train=2500,
+                                 tau_values=[1, 5, 10, 20, 50],
+                                 gamma_values=[0.001, 0.005, 0.01, 0.05, 0.1],
+                                 csv_filepath=csv_path)
+    plot_hyperparameter_ablation(csv_path, sys.name, "figures/linear_2d_hyperparam_ablation.pdf",
+                                 true_lambda=sys.lambda_u_true)
