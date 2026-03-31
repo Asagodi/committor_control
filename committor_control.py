@@ -1186,7 +1186,7 @@ def run_baseline_comparison(sys, a=0.5, r_neigh=np.inf, D_eval=0.01, dt=0.01,
                             num_trajs=500, T_sim=2000, T_train=2500, tau=10,
                             noise_levels=None, csv_filepath="figures/baselines.csv"):
     """Compare committor controller against LQR, sign-gated, and direct VAR baselines."""
-    if noise_levels is None: noise_levels = [0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1]
+    if noise_levels is None: noise_levels = [0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1, .5, 1.]
     w_u_norm = sys.w_u_true / np.linalg.norm(sys.w_u_true)
     w_s = np.random.default_rng(42).standard_normal(sys.x_star.size)
     w_s -= np.dot(w_s, w_u_norm) * w_u_norm; w_s /= np.linalg.norm(w_s) + 1e-15
