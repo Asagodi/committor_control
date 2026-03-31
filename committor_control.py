@@ -11,6 +11,7 @@ import csv
 import warnings
 import logging
 from functools import partial
+from collections import defaultdict
 
 import numpy as np
 import scipy.linalg
@@ -97,12 +98,12 @@ C_ENERGY  = "#b5432a"
 # Method visual encoding: marker + linestyle (color comes from metric)
 METHOD_STYLE = {
     "Optimal":            dict(marker="s", ls="-",  lw=1.8, label="Model-based"),
-    "CCA":                dict(marker="o", ls="--", lw=1.5, label="Data-enabled (wSVD)"),
+    "CCA":                dict(marker="o", ls="--", lw=1.5, label="Data-enabled"),
     "CCA (Adaptive)":     dict(marker="D", ls="-.", lw=1.5, label="Closed-loop"),
-    "CCA (Whitened)":     dict(marker="o", ls="--", lw=1.5, label="Data-enabled (wSVD)"),
+    "CCA (Whitened)":     dict(marker="o", ls="--", lw=1.5, label="Data-enabled"),
     "Oracle Committor":   dict(marker="s", ls="-",  lw=1.8, label="Committor (oracle)"),
     "Oracle ReLU":        dict(marker="v", ls="-",  lw=1.5, label="ReLU (oracle)"),
-    "Est CCA Committor":  dict(marker="o", ls="--", lw=1.5, label="Committor (wSVD)"),
+    "Est CCA Committor":  dict(marker="o", ls="--", lw=1.5, label="Data-enabled"),
     "Est CCA ReLU":       dict(marker="v", ls="--", lw=1.5, label="ReLU (wSVD)"),
     "Est VAR Committor":  dict(marker="p", ls=":",  lw=1.5, label="Committor (VAR)"),
 }
@@ -635,118 +636,91 @@ def simulate_adaptive_trajectory(x0, T, dt, drift_func, D, tracker, sys, a, r_ne
     return X, "timeout", energy
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6. Plotting Utilities
+# 6. Plotting Utilities (Compact & Unified)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def draw_invariant_manifolds(ax, sys):
     try:
-        eigvals, V_right = np.linalg.eig(sys.J)
-        order = np.argsort(eigvals.real)[::-1]
-        v_u = V_right[:, order[0]].real; v_u /= np.linalg.norm(v_u)
-        v_s = V_right[:, order[1]].real; v_s /= np.linalg.norm(v_s)
-        is_pendulum = (sys.name == "Pendulum")
-        eps = 1e-2; dt_int = 0.02; steps = 150
-        c_s = 'black'; c_u = 'black'; ls_s = '-'; ls_u = '-'; lw_str = 1.5
-        arrow_kwargs = dict(arrowstyle="-|>", color="black", lw=1.5, mutation_scale=15)
+        eigvals, V = np.linalg.eig(sys.J)
+        v_u, v_s = V[:, np.argsort(eigvals.real)[::-1][:2]].real
+        v_u /= np.linalg.norm(v_u); v_s /= np.linalg.norm(v_s)
         def rk4(f, x, h):
             k1 = f(0, x); k2 = f(0, x+k1*h/2); k3 = f(0, x+k2*h/2); k4 = f(0, x+k3*h)
             return x + (k1+2*k2+2*k3+k4)*h/6.0
-        if is_pendulum and sys.J[1, 1] == 0.0:
-            th = np.linspace(sys.plot_xlim[0] - 1.0, sys.plot_xlim[1] + 1.0, 500)
-            gl = sys.J[1, 0]
-            omega_upper = 2.0 * np.sqrt(gl) * np.cos(th / 2.0)
-            omega_lower = -2.0 * np.sqrt(gl) * np.cos(th / 2.0)
-            ax.plot(th, omega_upper, color='black', lw=1.8, alpha=0.85, zorder=2)
-            ax.plot(th, omega_lower, color='black', lw=1.8, alpha=0.85, zorder=2)
+        if sys.name == "Pendulum" and sys.J[1, 1] == 0.0:
+            th = np.linspace(sys.plot_xlim[0]-1, sys.plot_xlim[1]+1, 500)
+            w = 2.0 * np.sqrt(sys.J[1, 0]) * np.cos(th / 2.0)
+            ax.plot(th, w, color='k', lw=1.8, alpha=0.85, zorder=2)
+            ax.plot(th, -w, color='k', lw=1.8, alpha=0.85, zorder=2)
         else:
-            for sign in [1, -1]:
-                x = sys.x_star + sign * eps * v_s; traj = [x.copy()]
-                for _ in range(steps): x = rk4(sys.drift, x, -dt_int); traj.append(x.copy())
-                traj = np.array(traj)
-                ax.plot(traj[:, 0], traj[:, 1], color=c_s, ls=ls_s, lw=lw_str, alpha=0.8, zorder=2)
-                if len(traj) > 25:
-                    ax.annotate("", xy=traj[10][:2], xytext=traj[25][:2], arrowprops=arrow_kwargs, zorder=3)
-            for sign in [1, -1]:
-                x = sys.x_star + sign * eps * v_u; traj = [x.copy()]
-                for _ in range(steps): x = rk4(sys.drift, x, dt_int); traj.append(x.copy())
-                traj = np.array(traj)
-                ax.plot(traj[:, 0], traj[:, 1], color=c_u, ls=ls_u, lw=lw_str, alpha=0.8, zorder=2)
-                if len(traj) > 25:
-                    ax.annotate("", xy=traj[25][:2], xytext=traj[10][:2], arrowprops=arrow_kwargs, zorder=3)
-    except Exception as e:
-        print(f"Error drawing manifolds: {e}")
+            akw = dict(arrowstyle="-|>", color="k", lw=1.5, mutation_scale=15)
+            for v, step, c in [(v_s, -0.02, 'k'), (v_u, 0.02, 'k')]:
+                for sign in [1, -1]:
+                    x = sys.x_star + sign * 1e-2 * v; traj = [x.copy()]
+                    for _ in range(150): x = rk4(sys.drift, x, step); traj.append(x.copy())
+                    traj = np.array(traj)
+                    ax.plot(traj[:,0], traj[:,1], color=c, ls='-', lw=1.5, alpha=0.8, zorder=2)
+                    if len(traj) > 25:
+                        i1, i2 = (10, 25) if step < 0 else (25, 10)
+                        ax.annotate("", xy=traj[i1][:2], xytext=traj[i2][:2], arrowprops=akw, zorder=3)
+    except Exception as e: print(f"Error drawing manifolds: {e}")
 
 def draw_background(ax, sys, a):
-    c_desired = "#176533"; c_undesired = "#ed2024"
     e_true = sys.w_u_true[:2] / np.linalg.norm(sys.w_u_true[:2])
-    perp_dir = np.array([-e_true[1], e_true[0]])
-    scale = 5.0; x0 = sys.x_star[:2]
-    pt_desired = x0 + e_true * a
-    ax.plot([pt_desired[0] - perp_dir[0]*scale, pt_desired[0] + perp_dir[0]*scale],
-            [pt_desired[1] - perp_dir[1]*scale, pt_desired[1] + perp_dir[1]*scale],
-            color=c_undesired, linestyle="--", lw=1.5, zorder=1)
-    pt_undesired = x0 - e_true * a
-    ax.plot([pt_undesired[0] - perp_dir[0]*scale, pt_undesired[0] + perp_dir[0]*scale],
-            [pt_undesired[1] - perp_dir[1]*scale, pt_undesired[1] + perp_dir[1]*scale],
-            color=c_desired, linestyle="--", lw=1.5, zorder=1)
+    perp = np.array([-e_true[1], e_true[0]]) * 5.0; x0 = sys.x_star[:2]
+    for sign, c in [(1, "#ed2024"), (-1, "#176533")]:  # Red (undesired), Green (desired)
+        pt = x0 + sign * e_true * a
+        ax.plot([pt[0]-perp[0], pt[0]+perp[0]], [pt[1]-perp[1], pt[1]+perp[1]], color=c, ls="--", lw=1.5, zorder=1)
 
 def get_gradient_cmap(base_hex):
-    base_rgb = mcolors.hex2color(base_hex)
-    light_rgb = tuple(c + 0.5 * (1.0 - c) for c in base_rgb)
-    dark_rgb = tuple(c * 0.85 for c in base_rgb)
-    return mcolors.LinearSegmentedColormap.from_list("custom_grad", [light_rgb, base_rgb, dark_rgb])
+    base = mcolors.hex2color(base_hex)
+    return mcolors.LinearSegmentedColormap.from_list("grad", [
+        tuple(c + 0.5*(1-c) for c in base), base, tuple(c*0.85 for c in base)])
 
 def plot_trajectory_panels(panels, sys, a, is_single=False, combined=False, filepath=None):
-    n = len(panels)
+    n = len(panels); legend_handles = []
     if combined:
-        fig, ax = plt.subplots(figsize=(6.0, 6.0))
-        axes_flat = [ax] * n
-        draw_background(ax, sys, a)
-        draw_invariant_manifolds(ax, sys)
-        e_true = sys.w_u_true[:2].copy(); e_true /= np.linalg.norm(e_true) + 1e-15
-        ax.annotate("", xy=sys.x_star[:2] + (a * 0.6) * e_true, xytext=sys.x_star[:2],
-                    arrowprops=dict(arrowstyle="-|>", color="#2b3c96", lw=2.5), zorder=8)
-        legend_handles = []
+        fig, ax = plt.subplots(figsize=(6, 6)); axes_flat = [ax] * n
     else:
         cols = min(n, 3); rows = (n + cols - 1) // cols
-        fig, axes = plt.subplots(rows, cols, figsize=(4.0*cols, 4.0*rows))
+        fig, axes = plt.subplots(rows, cols, figsize=(4*cols, 4*rows))
         axes_flat = np.atleast_1d(axes).flatten()
         fig.subplots_adjust(wspace=0.1, hspace=0.2)
-    for i, panel in enumerate(panels):
+
+    for i, (label, col, est_dir, trajs, stats) in enumerate(panels):
         if not combined and i >= n: axes_flat[i].axis('off'); continue
         ax = axes_flat[i]
-        display_label, col, est_dir, trajs, stats_str = panel
         if not combined:
             draw_background(ax, sys, a); draw_invariant_manifolds(ax, sys)
-            e_true = sys.w_u_true[:2].copy(); e_true /= np.linalg.norm(e_true) + 1e-15
-            ax.annotate("", xy=sys.x_star[:2] + (a * 0.6) * e_true, xytext=sys.x_star[:2],
-                        arrowprops=dict(arrowstyle="-|>", color="black", lw=2.0), zorder=8)
+            e_true = sys.w_u_true[:2] / (np.linalg.norm(sys.w_u_true[:2]) + 1e-15)
+            ax.annotate("", xy=sys.x_star[:2] + (a*0.6)*e_true, xytext=sys.x_star[:2], arrowprops=dict(arrowstyle="-|>", color="k", lw=2.0), zorder=8)
+            ax.set_title(f"{label}\n{stats}", fontsize=9, pad=8, color=col if "Autonomous" not in label else "#333")
+        elif i == 0:
+            draw_background(ax, sys, a); draw_invariant_manifolds(ax, sys)
+            e_true = sys.w_u_true[:2] / (np.linalg.norm(sys.w_u_true[:2]) + 1e-15)
+            ax.annotate("", xy=sys.x_star[:2] + (a*0.6)*e_true, xytext=sys.x_star[:2], arrowprops=dict(arrowstyle="-|>", color="#2b3c96", lw=2.5), zorder=8)
+            
         if est_dir is not None:
-            e_est = est_dir[:2].copy(); e_est /= np.linalg.norm(e_est) + 1e-15
-            ax.annotate("", xy=sys.x_star[:2] + (a * 0.6) * e_est, xytext=sys.x_star[:2],
-                        arrowprops=dict(arrowstyle="-|>", color=col, lw=2.0, ls="dashed"), zorder=9)
+            e_est = est_dir[:2] / (np.linalg.norm(est_dir[:2]) + 1e-15)
+            ax.annotate("", xy=sys.x_star[:2] + (a*0.6)*e_est, xytext=sys.x_star[:2], arrowprops=dict(arrowstyle="-|>", color=col, lw=2.0, ls="dashed"), zorder=9)
+            
         cmap = get_gradient_cmap(col); dark_col = cmap(1.0)
-        alpha = 1.0 if is_single else max(0.4, min(0.8, 3.0/len(trajs)))
-        line_weight = 2.0 if is_single else 1.2; scatter_size = 40 if is_single else 25
-        for X, hs, _ in trajs:
-            pts = X[:, :2]
-            segs = np.concatenate([pts[:-1,None,:], pts[1:,None,:]], axis=1)
-            lc = LineCollection(segs, cmap=cmap, norm=plt.Normalize(0, len(X)), lw=line_weight, alpha=alpha, zorder=4)
+        alpha, lw_val, s_val = (1.0, 2.0, 40) if is_single else (max(0.4, min(0.8, 3.0/max(1, len(trajs)))), 1.2, 25)
+        
+        for X, _, _ in trajs:
+            pts = X[:, :2]; segs = np.concatenate([pts[:-1,None,:], pts[1:,None,:]], axis=1)
+            lc = LineCollection(segs, cmap=cmap, norm=plt.Normalize(0, len(X)), lw=lw_val, alpha=alpha, zorder=4)
             lc.set_array(np.arange(len(X)-1)); ax.add_collection(lc)
-            ax.scatter(*pts[-1], s=scatter_size, color=dark_col, edgecolors="white", lw=0.6, zorder=6)
-        if not combined:
-            ax.set_title(f"{display_label}\n{stats_str}", fontsize=9, pad=8, color=col if "Autonomous" not in display_label else "#333")
-            ax.set_xlim(sys.plot_xlim); ax.set_ylim(sys.plot_ylim); ax.set_xticks([]); ax.set_yticks([]); ax.set_aspect("equal")
-        else:
-            legend_handles.append(mlines.Line2D([], [], color=dark_col, lw=2.0, label=display_label))
-    if combined:
-        ax.set_xlim(sys.plot_xlim); ax.set_ylim(sys.plot_ylim); ax.set_xticks([]); ax.set_yticks([]); ax.set_aspect("equal")
-        ax.legend(handles=legend_handles, loc='upper center', ncol=3, fontsize=9, framealpha=0.9, bbox_to_anchor=(0.5, 1.0))
+            ax.scatter(*pts[-1], s=s_val, color=dark_col, edgecolors="w", lw=0.6, zorder=6)
+            
+        if combined: legend_handles.append(mlines.Line2D([], [], color=dark_col, lw=2.0, label=label))
+        if not combined or i == n-1:
+            ax.set(xlim=sys.plot_xlim, ylim=sys.plot_ylim, aspect="equal"); ax.set_xticks([]); ax.set_yticks([])
+            
+    if combined: ax.legend(handles=legend_handles, loc='upper center', ncol=3, fontsize=9, framealpha=0.9, bbox_to_anchor=(0.5, 1.0))
     if filepath:
-        fig.savefig(filepath, bbox_inches="tight")
-        fig.savefig(filepath.replace('.png','.pdf'), bbox_inches="tight")
-        mode = "Combined" if combined else "Grid"; traj_type = "single" if is_single else "multi"
-        print(f"Saved {mode} {traj_type} traj -> {filepath}")
+        fig.savefig(filepath, bbox_inches="tight"); fig.savefig(filepath.replace('.png','.pdf'), bbox_inches="tight")
+        print(f"Saved {'Combined' if combined else 'Grid'} {'single' if is_single else 'multi'} traj -> {filepath}")
     plt.close(fig)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -754,454 +728,259 @@ def plot_trajectory_panels(panels, sys, a, is_single=False, combined=False, file
 # ──────────────────────────────────────────────────────────────────────────────
 
 def generate_convergence_data(sys, a=0.5, D_train=0.01, dt=0.01, T_train=500, r_neigh=np.inf, num_trajs=20, tau=10, use_whitened=True, csv_filepath="figures/convergence_data.csv"):
-    print(f"  -> Generating convergence data (saved to {csv_filepath})...")
+    print(f" -> Generating convergence data ({csv_filepath})...")
     os.makedirs(os.path.dirname(csv_filepath), exist_ok=True)
-    log_interval = 1
     with open(csv_filepath, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(["Seed", "Step", "Cos_Sim", "Lambda_u", "D_val"])
+        writer = csv.writer(f); writer.writerow(["Seed", "Step", "Cos_Sim", "Lambda_u", "D_val"])
         for seed in range(num_trajs):
             tracker = OnlineCCATracker(dim=sys.x_star.size, dt=dt, gamma=0.01, tau=tau, min_steps=20, a=a, rng_seed=seed, use_whitened=use_whitened)
-            noise_std = np.sqrt(2.0 * D_train)
-            rng = np.random.default_rng(seed)
-            x = sys.x_star + rng.uniform(-0.1, 0.1, sys.x_star.size)
-            tracker.reset()
+            rng = np.random.default_rng(seed); x = sys.x_star + rng.uniform(-0.1, 0.1, sys.x_star.size)
             limit = r_neigh if r_neigh < np.inf else max(2.0, a * 2.0)
             for t in range(T_train):
-                x_next = (x + sys.drift(t * dt, x) * dt + noise_std * rng.standard_normal(sys.x_star.size) * np.sqrt(dt))
+                x_next = x + sys.drift(t*dt, x)*dt + np.sqrt(2.0*D_train) * rng.standard_normal(sys.x_star.size)*np.sqrt(dt)
                 if np.linalg.norm(x_next - sys.x_star) > limit:
-                    x = sys.x_star + rng.normal(0, 0.05, sys.x_star.size)
-                    tracker.reset()
-                    continue
-                tracker.update(x, x_next, sys.w_u_true)
-                x = x_next
-                if t % log_interval == 0 and tracker.n_updates >= tracker.min_steps:
+                    x = sys.x_star + rng.normal(0, 0.05, sys.x_star.size); tracker.reset(); continue
+                tracker.update(x, x_next, sys.w_u_true); x = x_next
+                if tracker.n_updates >= tracker.min_steps:
                     p = tracker.get_params(sys.w_u_true)
                     writer.writerow([seed, t, abs(float(np.dot(p['w_u'], sys.w_u_true))), p['lambda_u'], p['D']])
 
-def plot_convergence_from_data(csv_filepath, sys_lambda_true=2.0, sys_D_true=0.01, filepath="figures/convergence.pdf",
-                               layout="stacked", label_fontsize=12, tick_fontsize=11, legend_fontsize=10,
-                               burn_in=30, direction_ylim=(0.8, 1.0), lambda_ylim=(0.5, 2.5), D_ylim=(0.005, 0.015)):
+def plot_convergence_from_data(csv_filepath, sys_lambda_true=2.0, sys_D_true=0.01, filepath="figures/convergence.pdf", layout="stacked", label_fontsize=12, tick_fontsize=11, burn_in=30):
     set_ieee_style()
-    print(f"  -> Plotting {layout} convergence from {csv_filepath}...")
-    if not os.path.exists(csv_filepath):
-        print(f"     [ERROR] Could not find data at: {csv_filepath}"); return
-    data_by_step = {}
+    if not os.path.exists(csv_filepath): print(f" [!] Missing {csv_filepath}"); return
+    
+    data = defaultdict(lambda: {'cos': [], 'lam': [], 'D': []})
     with open(csv_filepath, 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            step = int(row['Step'])
-            if step not in data_by_step:
-                data_by_step[step] = {'cos': [], 'lam': [], 'D': []}
-            data_by_step[step]['cos'].append(float(row['Cos_Sim']))
-            data_by_step[step]['lam'].append(float(row['Lambda_u']))
-            data_by_step[step]['D'].append(float(row['D_val']))
-    steps = sorted(list(data_by_step.keys()))
+        for r in csv.DictReader(f):
+            s = int(r['Step'])
+            data[s]['cos'].append(float(r['Cos_Sim'])); data[s]['lam'].append(float(r['Lambda_u'])); data[s]['D'].append(float(r['D_val']))
+            
+    steps = sorted(data.keys())
     if not steps: return
-    burn_in_step = steps[min(burn_in, max(0, len(steps)-10))]
-    valid_steps = [s for s in steps if s >= burn_in_step]
-    cos_med, cos_q1, cos_q3 = [], [], []
-    lam_med, lam_q1, lam_q3 = [], [], []
-    D_med, D_q1, D_q3 = [], [], []
+    valid_steps = [s for s in steps if s >= steps[min(burn_in, max(0, len(steps)-10))]]
+    metrics = {'cos': [], 'lam': [], 'D': []}
+    
     for s in valid_steps:
-        c_arr = np.array(data_by_step[s]['cos'])
-        cos_med.append(np.median(c_arr)); cos_q1.append(np.percentile(c_arr, 25)); cos_q3.append(np.percentile(c_arr, 75))
-        l_arr = np.clip(data_by_step[s]['lam'], lambda_ylim[0] - 1.0, lambda_ylim[1] + 1.0)
-        lam_med.append(np.median(l_arr)); lam_q1.append(np.percentile(l_arr, 25)); lam_q3.append(np.percentile(l_arr, 75))
-        d_arr = np.clip(data_by_step[s]['D'], D_ylim[0] - 0.005, D_ylim[1] + 0.005)
-        D_med.append(np.median(d_arr)); D_q1.append(np.percentile(d_arr, 25)); D_q3.append(np.percentile(d_arr, 75))
-    c_dir = "#2d307b"; c_eig = "#19421e"; c_D = "#a01b2a"
+        for k in metrics:
+            arr = np.array(data[s][k])
+            metrics[k].append((np.median(arr), np.percentile(arr, 25), np.percentile(arr, 75)))
+            
+    metrics = {k: list(zip(*v)) for k, v in metrics.items()}
+    c_dir, c_eig, c_D = "#2d307b", "#19421e", "#a01b2a"
+    
     if layout == "stacked":
-        fig, axes = plt.subplots(3, 1, figsize=(5.5, 6), sharex=True)
-        ax1, ax2, ax3 = axes; fig.subplots_adjust(hspace=0.1)
-        ax1.plot(valid_steps, cos_med, color=c_dir, lw=2.0)
-        ax1.fill_between(valid_steps, cos_q1, cos_q3, color=c_dir, alpha=0.2)
-        ax1.axhline(1.0, color=c_dir, ls='--', lw=1.2, alpha=0.6)
-        ax1.set_ylabel(r"$|\cos(\hat{w}_u, w_u)|$", color=c_dir, fontsize=label_fontsize)
-        ax1.tick_params(axis='y', labelcolor=c_dir, labelsize=tick_fontsize); ax1.set_ylim(direction_ylim)
-        ax1.grid(True, linestyle='-', alpha=0.3, color='gray')
-        ax2.plot(valid_steps, lam_med, color=c_eig, lw=2.0)
-        ax2.fill_between(valid_steps, lam_q1, lam_q3, color=c_eig, alpha=0.2)
-        ax2.axhline(sys_lambda_true, color=c_eig, ls='--', lw=1.2, alpha=0.6)
-        ax2.set_ylabel(r"$\hat{\lambda}_u$", color=c_eig, fontsize=label_fontsize)
-        ax2.tick_params(axis='y', labelcolor=c_eig, labelsize=tick_fontsize); ax2.set_ylim(lambda_ylim)
-        ax2.grid(True, linestyle='-', alpha=0.3, color='gray')
-        ax3.plot(valid_steps, D_med, color=c_D, lw=2.0)
-        ax3.fill_between(valid_steps, D_q1, D_q3, color=c_D, alpha=0.2)
-        ax3.axhline(sys_D_true, color=c_D, ls='--', lw=1.2, alpha=0.6)
-        ax3.set_ylabel(r"$\hat{D}$", color=c_D, fontsize=label_fontsize)
-        ax3.tick_params(axis='y', labelcolor=c_D, labelsize=tick_fontsize); ax3.set_ylim(D_ylim)
-        ax3.grid(True, linestyle='-', alpha=0.3, color='gray')
-        ax3.set_xlabel("Training step", fontsize=label_fontsize)
-        ax3.tick_params(axis='x', labelsize=tick_fontsize); ax3.set_xlim([valid_steps[0], valid_steps[-1]])
-        fig.align_ylabels(axes)
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(5.5, 6), sharex=True); fig.subplots_adjust(hspace=0.1)
+        axes_data = [(ax1, 'cos', c_dir, r"$|\cos(\hat{w}_u, w_u)|$", 1.0), 
+                     (ax2, 'lam', c_eig, r"$\hat{\lambda}_u$", sys_lambda_true), 
+                     (ax3, 'D', c_D, r"$\hat{D}$", sys_D_true)]
+        for ax, k, c, ylab, true_val in axes_data:
+            ax.plot(valid_steps, metrics[k][0], color=c, lw=2.0)
+            ax.fill_between(valid_steps, metrics[k][1], metrics[k][2], color=c, alpha=0.2)
+            ax.axhline(true_val, color=c, ls='--', lw=1.2, alpha=0.6)
+            ax.set_ylabel(ylab, color=c, fontsize=label_fontsize)
+            ax.tick_params(axis='y', labelcolor=c, labelsize=tick_fontsize)
+            ax.grid(True, ls='-', alpha=0.3, color='gray')
+        ax3.set_xlabel("Training step", fontsize=label_fontsize); ax3.set_xlim([valid_steps[0], valid_steps[-1]])
+        fig.align_ylabels((ax1, ax2, ax3))
     elif layout == "combined":
         fig, ax1 = plt.subplots(figsize=(6.5, 3.5)); fig.subplots_adjust(right=0.78)
         ax2 = ax1.twinx(); ax3 = ax1.twinx(); ax3.spines["right"].set_position(("axes", 1.15))
-        ax1.plot(valid_steps, cos_med, color=c_dir, lw=2.0, label=r"Direction $|\cos(\hat{w}_u, w_u)|$")
-        ax1.fill_between(valid_steps, cos_q1, cos_q3, color=c_dir, alpha=0.2)
-        ax1.axhline(1.0, color=c_dir, ls='--', lw=1.2, alpha=0.6)
-        ax2.plot(valid_steps, lam_med, color=c_eig, lw=2.0, label=r"Eigenvalue $\hat{\lambda}_u$")
-        ax2.fill_between(valid_steps, lam_q1, lam_q3, color=c_eig, alpha=0.2)
-        ax2.axhline(sys_lambda_true, color=c_eig, ls='--', lw=1.2, alpha=0.6)
-        ax3.plot(valid_steps, D_med, color=c_D, lw=2.0, label=r"Noise $\hat{D}$")
-        ax3.fill_between(valid_steps, D_q1, D_q3, color=c_D, alpha=0.2)
-        ax3.axhline(sys_D_true, color=c_D, ls='--', lw=1.2, alpha=0.6)
-        ax1.set_ylim(direction_ylim); ax1.set_yticks(np.linspace(direction_ylim[0], direction_ylim[1], 5))
-        ax2.set_ylim(lambda_ylim); ax2.set_yticks(np.linspace(lambda_ylim[0], lambda_ylim[1], 5))
-        ax3.set_ylim(D_ylim); ax3.set_yticks(np.linspace(D_ylim[0], D_ylim[1], 5))
-        ax1.grid(True, linestyle='-', alpha=0.3, color='gray')
-        ax1.set_xlabel("Training step", fontsize=label_fontsize)
-        ax1.set_ylabel(r"$|\cos(\hat{w}_u, w_u)|$", color=c_dir, fontsize=label_fontsize)
-        ax2.set_ylabel(r"$\hat{\lambda}_u$", color=c_eig, fontsize=label_fontsize)
-        ax3.set_ylabel(r"$\hat{D}$", color=c_D, fontsize=label_fontsize)
-        ax1.tick_params(axis='y', labelcolor=c_dir, labelsize=tick_fontsize)
-        ax2.tick_params(axis='y', labelcolor=c_eig, labelsize=tick_fontsize)
-        ax3.tick_params(axis='y', labelcolor=c_D, labelsize=tick_fontsize)
-        ax1.tick_params(axis='x', labelsize=tick_fontsize); ax1.set_xlim([valid_steps[0], valid_steps[-1]])
-        lines_1, labels_1 = ax1.get_legend_handles_labels()
-        lines_2, labels_2 = ax2.get_legend_handles_labels()
-        lines_3, labels_3 = ax3.get_legend_handles_labels()
-        ax1.legend(lines_1 + lines_2 + lines_3, labels_1 + labels_2 + labels_3, loc='lower right', fontsize=legend_fontsize, framealpha=0.95)
-    fig.savefig(filepath, bbox_inches="tight")
-    fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight")
-    print(f"     Saved {layout} convergence plot -> {filepath}")
-    plt.close(fig)
+        axes_data = [(ax1, 'cos', c_dir, r"$|\cos(\hat{w}_u, w_u)|$", 1.0, r"Direction $|\cos(\hat{w}_u, w_u)|$"),
+                     (ax2, 'lam', c_eig, r"$\hat{\lambda}_u$", sys_lambda_true, r"Eigenvalue $\hat{\lambda}_u$"),
+                     (ax3, 'D', c_D, r"$\hat{D}$", sys_D_true, r"Noise $\hat{D}$")]
+        for ax, k, c, ylab, true_val, lab in axes_data:
+            ax.plot(valid_steps, metrics[k][0], color=c, lw=2.0, label=lab)
+            ax.fill_between(valid_steps, metrics[k][1], metrics[k][2], color=c, alpha=0.2)
+            ax.axhline(true_val, color=c, ls='--', lw=1.2, alpha=0.6)
+            ax.set_ylabel(ylab, color=c, fontsize=label_fontsize)
+            ax.tick_params(axis='y', labelcolor=c, labelsize=tick_fontsize)
+        ax1.grid(True, ls='-', alpha=0.3, color='gray'); ax1.set_xlabel("Training step", fontsize=label_fontsize)
+        ax1.set_xlim([valid_steps[0], valid_steps[-1]])
+        lines = sum([ax.get_legend_handles_labels()[0] for ax in (ax1, ax2, ax3)], [])
+        labels = sum([ax.get_legend_handles_labels()[1] for ax in (ax1, ax2, ax3)], [])
+        ax1.legend(lines, labels, loc='lower right', fontsize=10, framealpha=0.95)
+        
+    fig.savefig(filepath, bbox_inches="tight"); fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight"); plt.close(fig)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6c. Noise sweep & energy sweep
+# 6c/d. Combined Scaling, Noise, & Energy Sweep Plotting
 # ──────────────────────────────────────────────────────────────────────────────
-
-def plot_noise_sweep(csv_filepath="figures/dimensionality_scaling_stats.csv", plot_grid=False, log_x=True, fontsize=10):
-    set_ieee_style()
-    print("\n" + "-"*80 + "\n Plotting Noise Sweep\n" + "-"*80)
-    if not os.path.exists(csv_filepath):
-        print(f"  [!] Data file {csv_filepath} not found."); return
-    data = []
-    with open(csv_filepath, 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            data.append({'Dimension': int(row['Dimension']), 'Lambda_u': float(row['Lambda_u']),
-                         'Noise_D': float(row['Noise_D']), 'Method': row['Method'],
-                         'Success_Rate': float(row['Success_Rate']), 'Timeout_Rate': float(row['Timeout_Rate'])})
-    dims = sorted(list(set(d['Dimension'] for d in data)))
-    lams = sorted(list(set(d['Lambda_u'] for d in data)))
-    noises = sorted(list(set(d['Noise_D'] for d in data)))
-    non_zero_noises = [n for n in noises if n > 0]
-    pseudo_zero = min(non_zero_noises) / 3.0 if non_zero_noises else 0.0001
-    def map_x(n): return pseudo_zero if (log_x and n == 0.0) else n
-    if not plot_grid:
-        fig, ax = plt.subplots(1, 1, figsize=(5.5, 4.0))
-        lambda_color_palette = sns.color_palette("rocket", n_colors=len(lams))
-        dim_marker_list = ['-', '--', '-.', ':']
-        for i, lam in enumerate(lams):
-            for j, dim in enumerate(dims):
-                xs_zero, ys_zero, xs_pos, ys_pos = [], [], [], []
-                for noise in noises:
-                    row_data = next((r for r in data if r['Dimension'] == dim and r['Lambda_u'] == lam and r['Noise_D'] == noise and r['Method'] == "CCA"), None)
-                    if row_data is not None:
-                        val = row_data['Success_Rate'] + row_data['Timeout_Rate']
-                        if noise == 0.0: xs_zero.append(map_x(noise)); ys_zero.append(val)
-                        else: xs_pos.append(map_x(noise)); ys_pos.append(val)
-                if xs_zero: ax.plot(xs_zero, ys_zero, marker='o', markersize=4, color=lambda_color_palette[i], ls='none', lw=1.5)
-                if xs_pos: ax.plot(xs_pos, ys_pos, marker='o', markersize=4, color=lambda_color_palette[i], ls=dim_marker_list[j], lw=1.5)
-        ax.set_ylim(-0.05, 1.05)
-        if log_x:
-            ax.set_xscale('log'); ax.set_xticks([map_x(n) for n in noises])
-            ax.set_xticklabels(['0' if n == 0 else f"{n:.3g}" for n in noises], rotation=45, ha='right')
-            if non_zero_noises: ax.axvline(x=min(non_zero_noises)*0.6, color='gray', linestyle=':', alpha=0.5)
-        ax.set_yticks([0, 0.5, 1]); ax.set_ylabel("Success rate", fontsize=fontsize); ax.set_xlabel("Noise strength ($D$)", fontsize=fontsize)
-        col1 = [Line2D([0], [0], color='none', label=r'$\lambda_u$')]
-        for i, lam in enumerate(lams): col1.append(Line2D([0], [0], color=lambda_color_palette[i], lw=2.0, label=f" {int(lam)}"))
-        col2 = [Line2D([0], [0], color='none', label='Dim.')]
-        for j, dim in enumerate(dims): col2.append(Line2D([0], [0], color='gray', marker='o', ls=dim_marker_list[j], lw=1.5, label=f" {dim}"))
-        max_rows = max(len(col1), len(col2))
-        while len(col1) < max_rows: col1.append(Line2D([0], [0], color='none', label=''))
-        while len(col2) < max_rows: col2.append(Line2D([0], [0], color='none', label=''))
-        ax.legend(handles=col1 + col2, loc="lower left", fontsize=8, ncol=2)
-    fig.tight_layout()
-    out_file = csv_filepath[:-4]
-    if plot_grid: out_file += "_grid"
-    if log_x: out_file += "_log"
-    out_file += ".png"
-    fig.savefig(out_file, bbox_inches="tight"); fig.savefig(out_file.replace(".png", ".pdf"), bbox_inches="tight")
-    print(f"  Saved Noise Sweep Plot -> {out_file} (and .pdf)")
 
 def simulate_and_save_noise_energy_sweep(sys, a=0.5, dt=0.01, r_neigh=np.inf, num_trajs=100, T_sim=2000, T_train=2500, tau=10, use_whitened=True, noise_levels=None, csv_filepath="figures/noise_energy_sweep.csv"):
-    if noise_levels is None:
-        noise_levels = [0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1]
+    if noise_levels is None: noise_levels = [0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1]
     w_u_norm = sys.w_u_true / np.linalg.norm(sys.w_u_true)
     w_s = np.random.default_rng(42).standard_normal(sys.x_star.size)
     w_s -= np.dot(w_s, w_u_norm) * w_u_norm; w_s /= np.linalg.norm(w_s) + 1e-15
     os.makedirs(os.path.dirname(csv_filepath), exist_ok=True)
+    
     with open(csv_filepath, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["System", "Method", "Noise_D", "Success_Rate", "N_Total",
-                         "Mean_Energy_Succ", "Std_Energy_Succ", "N_Success",
-                         "Mean_Energy_All", "Std_Energy_All", "N_All"])
+        writer.writerow(["System", "Method", "Noise_D", "Success_Rate", "N_Total", "Mean_Energy_Succ", "Std_Energy_Succ", "N_Success", "Mean_Energy_All", "Std_Energy_All", "N_All"])
         for D_test in noise_levels:
             tracker = CCATracker(dim=sys.x_star.size, dt=dt, tau=tau, rng_seed=0, use_whitened=use_whitened)
             tracker.train(sys.drift, T_train, dt, max(D_test, 0.005), 0, a, sys.w_u_true, init_center=sys.x_star, r_neigh=r_neigh)
             tracker_online = OnlineCCATracker(dim=sys.x_star.size, dt=dt, gamma=0.01, tau=tau, min_steps=20, a=a, rng_seed=0, use_whitened=use_whitened)
             tracker_online.train(sys.drift, T_train, dt, max(D_test, 0.005), 0, sys.w_u_true, sys.x_star, r_neigh=r_neigh)
-            kw = dict(a=a, r_neigh=r_neigh)
-            if D_test < 1e-8: c_opt = partial(relu_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
-            else: c_opt = partial(erf_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
+            
+            c_opt = partial(relu_feedback if D_test < 1e-8 else erf_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, a=a, r_neigh=r_neigh)
             rng_ic = np.random.default_rng(11)
-            ics = [sys.x_star + rng_ic.uniform(0.02, a * 0.9) * w_u_norm + rng_ic.uniform(-a * 0.4, a * 0.4) * w_s for _ in range(num_trajs)]
-            methods_config = [
-                ('Optimal', c_opt, False, False, None),
-                ('CCA', None, True, False, tracker),
-                ('CCA (Adaptive)', None, True, True, tracker_online)
-            ]
-            for method_name, ctrl, use_tracker, is_adaptive, trk in methods_config:
-                successes = 0
-                energies_succ, energies_all = [], []
+            ics = [sys.x_star + rng_ic.uniform(0.02, a*0.9)*w_u_norm + rng_ic.uniform(-a*0.4, a*0.4)*w_s for _ in range(num_trajs)]
+            
+            for method_name, ctrl, use_tr, is_adp, trk in [('Optimal', c_opt, False, False, None), ('CCA', None, True, False, tracker), ('CCA (Adaptive)', None, True, True, tracker_online)]:
+                e_succ, e_all = [], []
                 for x0 in ics:
                     run_rng = np.random.default_rng(int(rng_ic.integers(0, 10**6)))
-                    if use_tracker:
-                        tr_copy = copy.deepcopy(trk)
-                        traj, hit_side, energy = simulate_adaptive_trajectory(x0, T_sim, dt, sys.drift, D_test, tr_copy, sys, a, r_neigh, None, run_rng, is_adaptive=is_adaptive)
-                    else:
-                        traj, hit_side, energy = simulate_trajectory(x0, T_sim, dt, sys.drift, D_test, ctrl, sys, a, run_rng)
-                    energies_all.append(energy)
-                    if hit_side == "reached_A":
-                        successes += 1; energies_succ.append(energy)
-                succ_rate = successes / num_trajs
-                me_s = np.mean(energies_succ) if energies_succ else 0.0
-                se_s = np.std(energies_succ) if energies_succ else 0.0
-                me_a = np.mean(energies_all) if energies_all else 0.0
-                se_a = np.std(energies_all) if energies_all else 0.0
-                writer.writerow([sys.name, method_name, D_test, succ_rate, num_trajs,
-                                 me_s, se_s, len(energies_succ), me_a, se_a, len(energies_all)])
-                print(f"  {sys.name} | {method_name:<20} | D={D_test:.4f} | SR={succ_rate:.2f} | E_succ={me_s:.3f}±{se_s:.3f} | E_all={me_a:.3f}")
+                    if use_tr: _, hit, en = simulate_adaptive_trajectory(x0, T_sim, dt, sys.drift, D_test, copy.deepcopy(trk), sys, a, r_neigh, None, run_rng, is_adaptive=is_adp)
+                    else: _, hit, en = simulate_trajectory(x0, T_sim, dt, sys.drift, D_test, ctrl, sys, a, run_rng)
+                    e_all.append(en)
+                    if hit == "reached_A": e_succ.append(en)
+                
+                writer.writerow([sys.name, method_name, D_test, len(e_succ)/num_trajs, num_trajs, np.mean(e_succ) if e_succ else 0, np.std(e_succ) if e_succ else 0, len(e_succ), np.mean(e_all), np.std(e_all), len(e_all)])
 
-def plot_noise_energy_sweep_data(csv_filepath="figures/noise_energy_sweep.csv", sys_name=None, filepath="figures/noise_energy_sweep.pdf", fontsize=10):
-    """Single-panel energy-only plot (legacy wrapper). Uses color-by-metric style."""
-    set_ieee_style()
-    data = _read_sweep_csv(csv_filepath, sys_name)
-    if not data: return
-    noises = sorted(set(d['Noise_D'] for d in data))
-    pseudo_zero, map_x, non_zero = _make_log_axis(noises)
-    methods_in_data = ["Optimal", "CCA", "CCA (Adaptive)"]
-    fig, ax = plt.subplots(1, 1, figsize=(4.5, 3.5))
-    for method in methods_in_data:
-        sty = _get_method_style(method)
-        xs, ys = [], []
-        for n in noises:
-            if method == "Optimal" and n == 0.0: continue
-            row = next((r for r in data if r['Noise_D'] == n and r['Method'] == method), None)
-            if row: xs.append(map_x(n)); ys.append(row['Mean_Energy_Succ'])
-        if xs: ax.plot(xs, ys, marker=sty['marker'], color=C_ENERGY, ls=sty['ls'], lw=sty['lw'], markersize=5, label=sty['label'])
-    ax.set_xscale('log'); ax.set_xticks([map_x(n) for n in noises])
-    ax.set_xticklabels(['0' if n == 0.0 else f"{n:.3g}" for n in noises], rotation=45, ha='right')
-    all_en = [d['Mean_Energy_Succ'] for d in data if d['Method'] in methods_in_data and d['Mean_Energy_Succ'] > 0]
-    if all_en: ax.set_ylim(min(all_en)*0.8, max(all_en)*1.25)
-    if non_zero: ax.axvline(x=pseudo_zero * 1.5, color='gray', ls=':', alpha=0.4, lw=0.6)
-    ax.set_xlabel("Noise strength ($D$)", fontsize=fontsize)
-    ax.set_ylabel("Mean control energy", fontsize=fontsize, color=C_ENERGY)
-    ax.tick_params(axis='y', colors=C_ENERGY)
-    ax.legend(loc='upper left', fontsize=fontsize-1)
-    _save_fig(fig, filepath)
-
-def plot_noise_energy_sweep_single_sys(sys, a=0.5, dt=0.01, r_neigh=np.inf, num_trajs=100, T_sim=2000, T_train=2500, tau=10, use_whitened=True, noise_levels=None, filepath="figures/noise_energy_sweep.pdf"):
-    csv_path = filepath.replace(".pdf", ".csv")
-    simulate_and_save_noise_energy_sweep(sys, a, dt, r_neigh, num_trajs, T_sim, T_train, tau, use_whitened, noise_levels, csv_path)
-    plot_noise_energy_sweep_data(csv_path, sys.name, filepath)
-
-def plot_success_and_energy_vs_noise(csv_filepath, sys_name, filepath,
-                                     layout="stacked", include_adaptive=False,
-                                     show_spread=True,
-                                     ylim_sr=(-0.05, 1.05), ylim_energy=None,
-                                     figsize=(5.5, 5.5),
-                                     label_fontsize=11, legend_fontsize=8):
+def plot_scaling_and_energy(csv_filepath, sys_name=None, filepath="figures/scaling_energy.pdf", 
+                            mode="stacked", layout=None, include_adaptive=False, 
+                            fontsize=16, ylim_sr=(-0.05, 1.05), ylim_en=None,
+                            figsize=None, legend_loc=None, legend_bbox=None):
     """
-    Publication-quality stacked sweep plot. Color encodes metric
-    (navy = success rate, warm = energy), markers/linestyles encode method.
+    Unified function to plot Success Rate and Mean Energy vs Noise. 
+    Accepts mode="stacked" (2 vertical panels) or mode="combined" (1 panel, dual y-axes).
     """
+    # 1. Apply base style FIRST so it doesn't overwrite our custom settings
     set_ieee_style()
+    
+    # 2. THEN override with CMU Roman and custom dynamic font sizes
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.serif": ["Computer Modern Roman", "Times New Roman", "serif"],
+        "mathtext.fontset": "cm",
+        "font.size": fontsize,
+        "axes.labelsize": fontsize,
+        "xtick.labelsize": fontsize - 2,
+        "ytick.labelsize": fontsize - 2,
+        "legend.fontsize": fontsize - 2,
+    })
+    
+    C_SUCCESS = "#2c327b"
+    C_ENERGY = "#025230"
+    
+    mode = layout if layout else mode
     data = _read_sweep_csv(csv_filepath, sys_name)
-    if not data: print(f"     [ERROR] No data for {sys_name} in {csv_filepath}"); return
+    if not data: print(f" [!] No data found in {csv_filepath}"); return
 
     noises = sorted(set(d['Noise_D'] for d in data))
     pseudo_zero, map_x, non_zero = _make_log_axis(noises)
+    methods = ["Optimal", "CCA"] + (["CCA (Adaptive)"] if include_adaptive else [])
+    
+    is_stacked = (mode == "stacked")
+    if is_stacked:
+        fs = figsize if figsize else (6.0, 6.0)
+        fig, (ax_sr, ax_en) = plt.subplots(2, 1, figsize=fs, sharex=True)
+        fig.subplots_adjust(hspace=0.08)
+    else:
+        fs = figsize if figsize else (6.5, 4.5)
+        fig, ax_sr = plt.subplots(figsize=fs)
+        ax_en = ax_sr.twinx()
 
-    methods = ["Optimal", "CCA"]
-    if include_adaptive: methods.append("CCA (Adaptive)")
-
-    fig, (ax_sr, ax_en) = plt.subplots(2, 1, figsize=figsize, sharex=True)
-    fig.subplots_adjust(hspace=0.08)
-    legend_handles = []
-
+    handles = []
     for method in methods:
         sty = _get_method_style(method)
-        xs_z, sr_z, en_z, sem_z = [], [], [], []
-        xs_p, sr_p, en_p, sem_p = [], [], [], []
-
+        
+        # Decouple success arrays from energy arrays
+        xs_z_sr, sr_z = [], []
+        xs_z_en, en_z, sem_z = [], [], []
+        xs_p_sr, sr_p = [], []
+        xs_p_en, en_p, sem_p = [], [], []
+        
         for n in noises:
             row = next((r for r in data if r['Noise_D'] == n and r['Method'] == method), None)
             if not row: continue
-            ns = row.get('N_Success', 0)
-            sem = row['Std_Energy_Succ'] / np.sqrt(max(ns, 1)) if ns > 0 else 0.0
-            bucket = (xs_z, sr_z, en_z, sem_z) if n == 0.0 else (xs_p, sr_p, en_p, sem_p)
-            bucket[0].append(map_x(n)); bucket[1].append(row['Success_Rate'])
-            bucket[2].append(row['Mean_Energy_Succ']); bucket[3].append(sem)
+            
+            total_success = float(row['Success_Rate']) + float(row.get('Timeout_Rate', 0.0))
+            ns = float(row.get('N_Success', 0))
+            x_val = map_x(n)
+            
+            if n == 0.0:
+                xs_z_sr.append(x_val)
+                sr_z.append(total_success)
+                if ns > 0:
+                    xs_z_en.append(x_val)
+                    en_z.append(float(row['Mean_Energy_Succ']))
+                    sem_z.append(float(row.get('Std_Energy_Succ', 0.0)) / np.sqrt(ns))
+            else:
+                xs_p_sr.append(x_val)
+                sr_p.append(total_success)
+                if ns > 0:
+                    xs_p_en.append(x_val)
+                    en_p.append(float(row['Mean_Energy_Succ']))
+                    sem_p.append(float(row.get('Std_Energy_Succ', 0.0)) / np.sqrt(ns))
 
-        # Success rate panel (navy)
-        if xs_z: ax_sr.plot(xs_z, sr_z, marker=sty['marker'], color=C_SUCCESS, ls='none', lw=sty['lw'], markersize=5)
-        if xs_p: ax_sr.plot(xs_p, sr_p, marker=sty['marker'], color=C_SUCCESS, ls=sty['ls'], lw=sty['lw'], markersize=5)
-        elif xs_z: ax_sr.plot([], [], marker=sty['marker'], color=C_SUCCESS, ls=sty.get('ls', '-'), lw=sty['lw'], markersize=5)
+        # Plot zero noise (isolated points)
+        if xs_z_sr:
+            ax_sr.plot(xs_z_sr, sr_z, marker='o', color=C_SUCCESS, ls='none', lw=sty['lw'], ms=5)
+        if xs_z_en:
+            ax_en.plot(xs_z_en, en_z, marker='o', color=C_ENERGY, ls='none', lw=sty['lw'], ms=5)
 
-        # Energy panel (warm) with optional spread
-        en_p_a, sem_p_a = np.array(en_p), np.array(sem_p)
-        en_z_a, sem_z_a = np.array(en_z), np.array(sem_z)
-        if xs_z:
-            ax_en.plot(xs_z, en_z_a, marker=sty['marker'], color=C_ENERGY, ls='none', lw=sty['lw'], markersize=5)
-            if show_spread and np.any(sem_z_a > 0):
-                ax_en.fill_between(xs_z, np.maximum(0, en_z_a - 1.96*sem_z_a), en_z_a + 1.96*sem_z_a, color=C_ENERGY, alpha=0.08)
-        if xs_p:
-            ax_en.plot(xs_p, en_p_a, marker=sty['marker'], color=C_ENERGY, ls=sty['ls'], lw=sty['lw'], markersize=5)
-            if show_spread and np.any(sem_p_a > 0):
-                ax_en.fill_between(xs_p, np.maximum(0, en_p_a - 1.96*sem_p_a), en_p_a + 1.96*sem_p_a, color=C_ENERGY, alpha=0.08)
+        # Plot positive noise (lines)
+        if xs_p_sr:
+            ls = sty.get('ls', '-')
+            ax_sr.plot(xs_p_sr, sr_p, marker='None', color=C_SUCCESS, ls=ls, lw=sty['lw'])
+        if xs_p_en:
+            ls = sty.get('ls', '-')
+            en_a, sem_a = np.array(en_p), np.array(sem_p)
+            ax_en.plot(xs_p_en, en_a, marker='None', color=C_ENERGY, ls=ls, lw=sty['lw'])
+            if np.any(sem_a > 0): 
+                ax_en.fill_between(xs_p_en, np.maximum(0, en_a - 1.96*sem_a), en_a + 1.96*sem_a, color=C_ENERGY, alpha=0.08)
+        
+        handles.append(mlines.Line2D([], [], color='#333', marker='None', ls=sty.get('ls','-'), lw=sty['lw'], label=sty['label']))
 
-        legend_handles.append(Line2D([], [], color='#333', marker=sty['marker'], ls=sty['ls'], lw=sty['lw'], markersize=5, label=sty['label']))
-
-    ax_sr.set_ylim(ylim_sr)
-    ax_sr.set_ylabel("Success rate", fontsize=label_fontsize, color=C_SUCCESS)
+    # Formatting Success Rate
+    ax_sr.set_ylabel("Success rate", color=C_SUCCESS)
     ax_sr.tick_params(axis='y', colors=C_SUCCESS)
-    ax_sr.legend(handles=legend_handles, loc='lower left', fontsize=legend_fontsize, framealpha=0.9)
-
-    if ylim_energy is not None: ax_en.set_ylim(ylim_energy)
+    ax_sr.set_ylim(ylim_sr)
+    
+    # FORCE MIN/MAX TICKS ONLY & FORMAT AS INTEGERS IF POSSIBLE
+    sr_ticks = [max(0.0, ylim_sr[0]), min(1.0, ylim_sr[1])]
+    ax_sr.set_yticks(sr_ticks)
+    ax_sr.set_yticklabels([f"{t:g}" for t in sr_ticks])
+    
+    # Formatting Energy
+    all_en = [d['Mean_Energy_Succ'] for d in data if d['Method'] in methods and d.get('N_Success', 0) > 0]
+    if ylim_en is not None:
+        y_min, y_max = ylim_en
+    elif all_en: 
+        y_min, y_max = min(all_en)*0.8, max(all_en)*1.25
     else:
-        all_en = [d['Mean_Energy_Succ'] for d in data if d['Method'] in methods and d['Mean_Energy_Succ'] > 0]
-        if all_en: ax_en.set_ylim(min(all_en)*0.8, max(all_en)*1.25)
-    ax_en.set_ylabel("Mean control energy", fontsize=label_fontsize, color=C_ENERGY)
+        y_min, y_max = 0, 1  # Fallback
+        
+    ax_en.set_ylim(y_min, y_max)
+    ax_en.set_ylabel("Control energy", color=C_ENERGY)
     ax_en.tick_params(axis='y', colors=C_ENERGY)
-    ax_en.set_xscale('log'); ax_en.set_xticks([map_x(n) for n in noises])
-    ax_en.set_xticklabels(['0' if n == 0.0 else f"{n:.3g}" for n in noises], rotation=45, ha='right')
-    ax_en.set_xlabel("Noise strength ($D$)", fontsize=label_fontsize)
+    
+    # FORCE MIN/MAX TICKS ONLY (Calculated Limits)
+    en_ticks = [y_min, y_max]
+    ax_en.set_yticks(en_ticks)
+    ax_en.set_yticklabels([f"{t:g}" for t in en_ticks])
+
+    # Shared formatting
+    base_ax = ax_en if is_stacked else ax_sr
+    base_ax.set_xscale('log')
+    base_ax.set_xticks([map_x(n) for n in noises])
+    base_ax.set_xticklabels(['0' if n == 0.0 else f"{n:.3g}" for n in noises], rotation=45, ha='right')
+    base_ax.set_xlabel("Noise strength ($D$)")
+    
     if non_zero:
-        for ax in (ax_sr, ax_en): ax.axvline(x=pseudo_zero * 1.5, color='gray', ls=':', alpha=0.4, lw=0.6)
-    fig.align_ylabels([ax_sr, ax_en])
-    _save_fig(fig, filepath)
+        for ax in ([ax_sr, ax_en] if is_stacked else [ax_sr]): 
+            ax.axvline(x=pseudo_zero * 1.5, color='gray', ls=':', alpha=0.4, lw=0.6)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 6d. Combined scaling + energy plot
-# ──────────────────────────────────────────────────────────────────────────────
-
-def plot_scaling_and_energy(dim_csv_filepath, energy_csv_filepath, filepath="figures/combined_scaling_energy.pdf",
-                            include_adaptive=False, line_alpha=0.8,
-                            success_ylim=(0.45, 1.05), success_yticks=(0.5, 1.0),
-                            energy_ylim=None, energy_yticks=None,
-                            legend_fontsize=12, label_fontsize=12, title_fontsize=13):
-    set_ieee_style()
-    fig, (ax_scale, ax_energy) = plt.subplots(2, 1, figsize=(6, 6.5), sharex=True)
-    fig.subplots_adjust(hspace=0.1)
-    print(f"  -> Plotting stacked combined figure...")
-    # --- PANEL A: DIMENSIONALITY SCALING ---
-    noises = []
-    non_zero_noises = []
-    pseudo_zero = 0.0001
-    def map_x(n): return pseudo_zero if n == 0.0 else n
-    if os.path.exists(dim_csv_filepath):
-        data_dim = []; methods_scale = ["CCA"]
-        if include_adaptive: methods_scale.append("CCA (Adaptive)")
-        with open(dim_csv_filepath, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if row['Method'] not in methods_scale: continue
-                data_dim.append({'Method': row['Method'], 'Dimension': int(row['Dimension']),
-                                 'Lambda_u': float(row['Lambda_u']), 'Noise_D': float(row['Noise_D']),
-                                 'Value': float(row['Success_Rate']) + float(row.get('Timeout_Rate', 0.0))})
-        if data_dim:
-            dims = sorted(list(set(d['Dimension'] for d in data_dim)))
-            lams = sorted(list(set(d['Lambda_u'] for d in data_dim)))
-            noises = sorted(list(set(d['Noise_D'] for d in data_dim)))
-            non_zero_noises = [n for n in noises if n > 0]
-            pseudo_zero = min(non_zero_noises) / 2.0 if non_zero_noises else 0.0001
-            def map_x(n): return pseudo_zero if n == 0.0 else n
-            palettes = {
-                lams[0]: [plt.cm.Purples(x) for x in np.linspace(0.85, 0.4, len(dims))],
-                lams[1]: [plt.cm.Oranges(x) for x in np.linspace(0.85, 0.4, len(dims))]
-            }
-            dim_markers = ['o', 'D', 'X', '^', 's']
-            for method in methods_scale:
-                ls_val = '-' if method == "CCA" else '--'
-                alpha_val = line_alpha if method == "CCA" else line_alpha * 0.75
-                for i, lam in enumerate(lams):
-                    colors = palettes[lam]
-                    for j, dim in enumerate(dims):
-                        xs_zero, ys_zero, xs_pos, ys_pos = [], [], [], []
-                        for noise in noises:
-                            row = next((r for r in data_dim if r['Method'] == method and r['Dimension'] == dim and r['Lambda_u'] == lam and r['Noise_D'] == noise), None)
-                            if row:
-                                if noise == 0.0: xs_zero.append(map_x(noise)); ys_zero.append(row['Value'])
-                                else: xs_pos.append(map_x(noise)); ys_pos.append(row['Value'])
-                        col = colors[j]; mrk = dim_markers[j % len(dim_markers)]
-                        if xs_zero: ax_scale.plot(xs_zero, ys_zero, marker=mrk, markersize=5, color=col, ls='none', alpha=alpha_val)
-                        if xs_pos: ax_scale.plot(xs_pos, ys_pos, marker=mrk, markersize=5, color=col, ls=ls_val, lw=1.5, alpha=alpha_val)
-            ax_scale.set_ylim(success_ylim); ax_scale.set_yticks(success_yticks)
-            if non_zero_noises: ax_scale.axvline(x=pseudo_zero * 1.5, color='gray', linestyle=':', alpha=0.5)
-            ax_scale.set_ylabel("Success rate", fontsize=label_fontsize)
-            legend_elements = [Line2D([0], [0], color='none', label=r'$\lambda_u$')]
-            for lam in lams:
-                mid_color = palettes[lam][len(dims)//2]
-                legend_elements.append(Line2D([0], [0], color=mid_color, lw=2.0, label=f" {int(lam)}"))
-            legend_elements.append(Line2D([0], [0], color='none', label='Dim.'))
-            for j, dim in enumerate(dims):
-                gray_val = str(0.2 + (j / len(dims)) * 0.5)
-                mrk = dim_markers[j % len(dim_markers)]
-                legend_elements.append(Line2D([0], [0], color=gray_val, marker=mrk, ls='-', lw=1.5, label=f" {dim}"))
-            if include_adaptive:
-                legend_elements.append(Line2D([0], [0], color='none', label='Mode'))
-                legend_elements.append(Line2D([0], [0], color='gray', ls='-', lw=1.5, label=' Static'))
-                legend_elements.append(Line2D([0], [0], color='gray', ls='--', lw=1.5, label=' Adapt'))
-            ax_scale.legend(handles=legend_elements, loc="lower left", fontsize=legend_fontsize, ncol=3 if include_adaptive else 2, framealpha=0.95)
-    else:
-        print(f"     [ERROR] Could not find Dimensionality CSV at: {dim_csv_filepath}")
-    # --- PANEL B: ENERGY SWEEP ---
-    data_en = _read_sweep_csv(energy_csv_filepath)
-    if data_en:
-        methods_en = ["Optimal", "CCA"]
-        if include_adaptive: methods_en.append("CCA (Adaptive)")
-        if not noises:
-            noises = sorted(set(d['Noise_D'] for d in data_en))
-            non_zero_noises = [n for n in noises if n > 0]
-            pseudo_zero = min(non_zero_noises) / 2.0 if non_zero_noises else 0.0001
-        for method in methods_en:
-            sty = _get_method_style(method)
-            xs, ys, sems = [], [], []
-            for n in noises:
-                if method == "Optimal" and n == 0.0: continue
-                row = next((r for r in data_en if r['Noise_D'] == n and r['Method'] == method), None)
-                if row:
-                    ns = row.get('N_Success', 0)
-                    sem = row['Std_Energy_Succ'] / np.sqrt(max(ns, 1)) if ns > 0 else 0.0
-                    xs.append(map_x(n)); ys.append(row['Mean_Energy_Succ']); sems.append(sem)
-            if xs:
-                ys_a, sems_a = np.array(ys), np.array(sems)
-                ax_energy.plot(xs, ys_a, marker=sty['marker'], color=C_ENERGY, ls=sty['ls'],
-                               lw=sty['lw'], markersize=5, label=sty['label'])
-                if np.any(sems_a > 0):
-                    ax_energy.fill_between(xs, np.maximum(0, ys_a - 1.96*sems_a),
-                                           ys_a + 1.96*sems_a, color=C_ENERGY, alpha=0.08)
-        all_en = [d['Mean_Energy_Succ'] for d in data_en if d['Method'] in methods_en and d['Mean_Energy_Succ'] > 0]
-        if energy_ylim: ax_energy.set_ylim(energy_ylim)
-        elif all_en: ax_energy.set_ylim(min(all_en)*0.8, max(all_en)*1.25)
-        if energy_yticks: ax_energy.set_yticks(energy_yticks)
-        if non_zero_noises: ax_energy.axvline(x=pseudo_zero * 1.5, color='gray', ls=':', alpha=0.4, lw=0.6)
-        ax_energy.set_ylabel("Mean control energy", fontsize=label_fontsize, color=C_ENERGY)
-        ax_energy.tick_params(axis='y', colors=C_ENERGY)
-        ax_energy.legend(loc='upper left', fontsize=legend_fontsize)
-    else:
-        print(f"     [ERROR] Could not find Energy CSV at: {energy_csv_filepath}")
-    ax_energy.set_xscale('log')
-    if noises:
-        ax_energy.set_xticks([map_x(n) for n in noises])
-        ax_energy.set_xticklabels(['0' if n == 0.0 else f"{n:.3g}" for n in noises], rotation=45, ha='right')
-    ax_energy.set_xlabel("Noise strength ($D$)", fontsize=label_fontsize)
-    ax_scale.tick_params(axis='y', labelsize=label_fontsize)
-    fig.align_ylabels([ax_scale, ax_energy])
+    # Apply dynamic legend placement
+    if legend_loc is None:
+        legend_loc = 'center left' if is_stacked else 'lower left'
+    if legend_bbox is None:
+        legend_bbox = (1.15, 0.5) if is_stacked else None
+        
+    ax_sr.legend(handles=handles, loc=legend_loc, bbox_to_anchor=legend_bbox, frameon=False)
+                 
+    if is_stacked: fig.align_ylabels([ax_sr, ax_en])
     _save_fig(fig, filepath)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1212,46 +991,47 @@ def plot_control_comparison(sys, a=0.5, D_eval=0.01, dt=0.01, T_sim=1000, r_neig
     set_ieee_style()
     tracker = OnlineCCATracker(dim=sys.x_star.size, dt=dt, gamma=0.01, tau=tau, min_steps=20, a=a, rng_seed=0, use_whitened=use_whitened)
     tracker.train(sys.drift, T_train, dt, max(D_eval, 0.005), 0, sys.w_u_true, sys.x_star, r_neigh=r_neigh)
-    rng = np.random.default_rng(42)
-    w_u_norm = sys.w_u_true / np.linalg.norm(sys.w_u_true)
-    kw = dict(a=a, r_neigh=r_neigh)
-    c_opt = partial(erf_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_eval, x_fp=sys.x_star, **kw)
+    
+    rng, w_u_norm = np.random.default_rng(42), sys.w_u_true / np.linalg.norm(sys.w_u_true)
+    c_opt = partial(erf_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_eval, x_fp=sys.x_star, a=a, r_neigh=r_neigh)
+    
     fig, axes = plt.subplots(2, 1, figsize=(6, 4.5), sharex=True)
-    c_opt_col = PLOT_CONFIG["COLORS"].get("Optimal"); c_cca_col = PLOT_CONFIG["COLORS"].get("CCA")
-    lbl_opt = PLOT_CONFIG["LABELS"].get("Optimal"); lbl_cca = PLOT_CONFIG["LABELS"].get("CCA")
+    c_opt_col, c_cca_col = PLOT_CONFIG["COLORS"].get("Optimal", "k"), PLOT_CONFIG["COLORS"].get("CCA", "b")
     alpha_val = 0.8 if num_trajs == 1 else max(0.02, 2.0 / num_trajs)
+    
     for i in range(num_trajs):
-        x0 = sys.x_star + rng.uniform(0.1, 0.3) * w_u_norm
-        noise_seq = np.sqrt(2.0 * D_eval) * rng.standard_normal((T_sim, sys.x_star.size)) * np.sqrt(dt)
-        x = x0.copy(); xu_opt, u_opt = [], []
+        x0, noise_seq = sys.x_star + rng.uniform(0.1, 0.3) * w_u_norm, np.sqrt(2.0 * D_eval) * rng.standard_normal((T_sim, sys.x_star.size)) * np.sqrt(dt)
+        x_opt, xu_opt, u_opt = x0.copy(), [], []
+        x_cca, xu_cca, u_cca, tr_copy = x0.copy(), [], [], copy.deepcopy(tracker); tr_copy.reset()
+        
         for t in range(T_sim):
-            x_u = float(np.dot(sys.w_u_true, x - sys.x_star))
-            if abs(x_u) >= a: break
-            u = c_opt(x); xu_opt.append(x_u); u_opt.append(float(np.dot(sys.w_u_true, u)))
-            x = x + (sys.drift(t * dt, x) + u) * dt + noise_seq[t]
-        tracker_copy = copy.deepcopy(tracker); x = x0.copy(); xu_cca, u_cca = [], []; tracker_copy.reset()
-        for t in range(T_sim):
-            x_u = float(np.dot(sys.w_u_true, x - sys.x_star))
-            if abs(x_u) >= a: break
-            params = tracker_copy.get_params(sys.w_u_true)
-            u = erf_feedback(x, params['w_u'], params['lambda_u'], params['D'], params['x_star'], a, r_neigh)
-            u = np.clip(u, -50.0, 50.0); xu_cca.append(x_u); u_cca.append(float(np.dot(sys.w_u_true, u)))
-            drift_val = sys.drift(t * dt, x); x_next = x + (drift_val + u) * dt + noise_seq[t]
-            x_pseudo = x + drift_val * dt + noise_seq[t]; tracker_copy.update(x, x_pseudo, sys.w_u_true); x = x_next
-        time_opt = np.arange(len(xu_opt)) * dt; time_cca = np.arange(len(xu_cca)) * dt
-        l_opt = lbl_opt if i == 0 else ""; l_cca = lbl_cca if i == 0 else ""
-        axes[0].plot(time_opt, xu_opt, color=c_opt_col, lw=1.2, label=l_opt, alpha=alpha_val)
-        axes[0].plot(time_cca, xu_cca, color=c_cca_col, lw=1.2, label=l_cca, alpha=alpha_val)
+            # Optimal Simulation
+            x_u = float(np.dot(sys.w_u_true, x_opt - sys.x_star))
+            if abs(x_u) < a:
+                u = c_opt(x_opt); xu_opt.append(x_u); u_opt.append(float(np.dot(sys.w_u_true, u)))
+                x_opt += (sys.drift(t*dt, x_opt) + u)*dt + noise_seq[t]
+            
+            # CCA Simulation
+            x_u_cca = float(np.dot(sys.w_u_true, x_cca - sys.x_star))
+            if abs(x_u_cca) < a:
+                p = tr_copy.get_params(sys.w_u_true)
+                u = np.clip(erf_feedback(x_cca, p['w_u'], p['lambda_u'], p['D'], p['x_star'], a, r_neigh), -50.0, 50.0)
+                xu_cca.append(x_u_cca); u_cca.append(float(np.dot(sys.w_u_true, u)))
+                drift_val = sys.drift(t*dt, x_cca)
+                x_next = x_cca + (drift_val + u)*dt + noise_seq[t]
+                tr_copy.update(x_cca, x_cca + drift_val*dt + noise_seq[t], sys.w_u_true); x_cca = x_next
+                
+        time_opt, time_cca = np.arange(len(xu_opt))*dt, np.arange(len(xu_cca))*dt
+        axes[0].plot(time_opt, xu_opt, color=c_opt_col, lw=1.2, label=PLOT_CONFIG["LABELS"].get("Optimal") if i==0 else "", alpha=alpha_val)
+        axes[0].plot(time_cca, xu_cca, color=c_cca_col, lw=1.2, label=PLOT_CONFIG["LABELS"].get("CCA") if i==0 else "", alpha=alpha_val)
         axes[1].plot(time_opt, u_opt, color=c_opt_col, lw=1.2, alpha=alpha_val)
         axes[1].plot(time_cca, u_cca, color=c_cca_col, lw=1.2, alpha=alpha_val)
-    axes[0].axhline(0, color='grey', ls=':', lw=0.8); axes[0].axhline(a, color='#cc0000', ls='--', lw=0.8, alpha=0.7)
-    axes[0].axhline(-a, color='#208820', ls='--', lw=0.8, alpha=0.7)
-    axes[0].set_ylabel(r"$x_u = w_u^\top(x - x^\ast)$"); axes[0].legend(loc="upper right")
-    axes[1].axhline(0, color='grey', ls=':', lw=0.8); axes[1].set_xlabel("Time"); axes[1].set_ylabel(r"$w_u^\top u(x)$ (control effort)")
-    fig.tight_layout()
-    fig.savefig(filepath, bbox_inches="tight"); fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight")
-    plt.close(fig); print(f"Saved control comparison -> {filepath}")
 
+    axes[0].axhline(0, color='grey', ls=':', lw=0.8); axes[0].axhline(a, color='#cc0000', ls='--', lw=0.8, alpha=0.7); axes[0].axhline(-a, color='#208820', ls='--', lw=0.8, alpha=0.7)
+    axes[0].set_ylabel(r"$x_u = w_u^\top(x - x^\ast)$"); axes[0].legend(loc="upper right")
+    axes[1].axhline(0, color='grey', ls=':', lw=0.8); axes[1].set(xlabel="Time", ylabel=r"$w_u^\top u(x)$ (control effort)")
+    fig.tight_layout(); fig.savefig(filepath, bbox_inches="tight"); fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight"); plt.close(fig)
+    
 # ──────────────────────────────────────────────────────────────────────────────
 # 7. Base Evaluation Suite
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1325,53 +1105,78 @@ def run_evaluation_suite(sys, B_restrictive=None, a=0.5, r_neigh=np.inf, D_eval=
     plot_trajectory_panels(multi_trajs, sys, a, is_single=False, filepath=f"figures/{sys.name}{suffix}_multi_traj.png")
     plot_trajectory_panels(single_trajs, sys, a, is_single=True, combined=True, filepath=f"figures/{sys.name}{suffix}_single_traj_combined.png")
 
-def run_dimensionality_scaling_experiment(dt=0.01, num_trajs=1000, T_sim=5000, use_whitened=True, dimensions=[2, 5, 10, 20], lambdas=[2.0, 5.0],
-                                          noise_levels=[0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.075, 0.1]):
+def run_dimensionality_scaling_experiment(dt=0.01, num_trajs=1000, T_sim=5000, use_whitened=True, 
+                                         dimensions=[2, 5, 10, 20], lambdas=[2.0, 5.0],
+                                         noise_levels=[0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.075, 0.1],
+                                         energy_csv_reference="figures/noise_sweep_stats_WHITENED_CCA.csv"):
     print("\n" + "="*80)
     mode_str = "WHITENED CCA" if use_whitened else "STANDARD CCA (Algo 1)"
     print(f" Dimensionality Scaling Experiment | Mode: {mode_str}")
     print("="*80)
+    
     a, r_neigh = 0.5, np.inf
     clean_mode_str = mode_str.replace(" ", "_").replace("(", "").replace(")", "").replace(".", "")
-    filepath = f"figures/dimensionality_scaling_stats_{clean_mode_str}.csv"
-    with open(filepath, 'w', newline='') as f:
+    dim_filepath = f"figures/dimensionality_scaling_stats_{clean_mode_str}.csv"
+    
+    # --- Data Collection ---
+    with open(dim_filepath, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(["Dimension", "Lambda_u", "Noise_D", "Method", "Success_Rate", "Timeout_Rate", "Fail_Rate"])
+        
         for dim in dimensions:
             for lam_u in lambdas:
+                # [cite: 52] System dynamics linearization [cite: 80]
                 sys = make_random_linear_system(dim, lam_u)
                 w_u_norm = sys.w_u_true / np.linalg.norm(sys.w_u_true)
+                
+                # Orthogonal stable direction for initial condition sampling [cite: 233]
                 w_s = np.random.default_rng(42).standard_normal(dim)
-                w_s -= np.dot(w_s, w_u_norm) * w_u_norm; w_s /= np.linalg.norm(w_s)+1e-15
+                w_s -= np.dot(w_s, w_u_norm) * w_u_norm
+                w_s /= np.linalg.norm(w_s) + 1e-15
+                
                 for D_test in noise_levels:
                     rng_ic = np.random.default_rng(11)
-                    ics = [sys.x_star + rng_ic.uniform(0.02, a*0.9)*w_u_norm + rng_ic.uniform(-a*0.4, a*0.4)*w_s for _ in range(num_trajs)]
+                    # ICs sampled on undesired side [cite: 233, 646]
+                    ics = [sys.x_star + rng_ic.uniform(0.02, a*0.9)*w_u_norm + 
+                           rng_ic.uniform(-a*0.4, a*0.4)*w_s for _ in range(num_trajs)]
+                    
+                    # Oracle Controller (ReLU for D=0, Erf/Committor for D>0) [cite: 125, 156]
                     kw = dict(a=a, r_neigh=r_neigh)
-                    if D_test < 1e-8: c_opt = partial(relu_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
-                    else: c_opt = partial(erf_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
+                    if D_test < 1e-8: 
+                        c_opt = partial(relu_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
+                    else: 
+                        c_opt = partial(erf_feedback, w_u=sys.w_u_true, lambda_u=sys.lambda_u_true, D=D_test, x_fp=sys.x_star, **kw)
+                    
+                    # Simulation [cite: 166, 642]
                     opt_results = [simulate_trajectory(x0, T_sim, dt, sys.drift, D_test, c_opt, sys, a, np.random.default_rng())[1] for x0 in ics]
                     hits_opt = sum(1 for hs in opt_results if hs == "reached_A")
-                    time_opt = sum(1 for hs in opt_results if hs == "timeout")
-                    fail_opt = sum(1 for hs in opt_results if hs == "hit_B")
+                    
+                    # Data-Enabled Controller Training (Algorithm 1) [cite: 190, 602]
                     D_train = max(D_test, 0.005)
                     alg = CCATracker(dim=dim, dt=dt, tau=10, rng_seed=0, use_whitened=use_whitened)
                     alg.train(sys.drift, 2500, dt, D_train, 0, a, sys.w_u_true, init_center=sys.x_star)
-                    alg_online = OnlineCCATracker(dim=dim, dt=dt, gamma=0.01, tau=10, min_steps=20, a=a, rng_seed=0, use_whitened=use_whitened)
-                    alg_online.train(sys.drift, 2500, dt, D_train, 0, sys.w_u_true, sys.x_star)
+                    
+                    # Evaluation [cite: 266, 675]
                     cca_results = [simulate_adaptive_trajectory(x0, T_sim, dt, sys.drift, D_test, copy.deepcopy(alg), sys, a, r_neigh, None, np.random.default_rng(), is_adaptive=False)[1] for x0 in ics]
                     hits_cca = sum(1 for hs in cca_results if hs == "reached_A")
                     time_cca = sum(1 for hs in cca_results if hs == "timeout")
                     fail_cca = sum(1 for hs in cca_results if hs == "hit_B")
-                    cca_adapt_results = [simulate_adaptive_trajectory(x0, T_sim, dt, sys.drift, D_test, copy.deepcopy(alg_online), sys, a, r_neigh, None, np.random.default_rng(), is_adaptive=True)[1] for x0 in ics]
-                    hits_adapt = sum(1 for hs in cca_adapt_results if hs == "reached_A")
-                    time_adapt = sum(1 for hs in cca_adapt_results if hs == "timeout")
-                    fail_adapt = sum(1 for hs in cca_adapt_results if hs == "hit_B")
-                    writer.writerow([dim, lam_u, D_test, "Optimal", hits_opt/num_trajs, time_opt/num_trajs, fail_opt/num_trajs])
+                    
                     writer.writerow([dim, lam_u, D_test, "CCA", hits_cca/num_trajs, time_cca/num_trajs, fail_cca/num_trajs])
-                    writer.writerow([dim, lam_u, D_test, "CCA (Adaptive)", hits_adapt/num_trajs, time_adapt/num_trajs, fail_adapt/num_trajs])
-                    print(f"  Dim {dim:2}, lam_u {lam_u:3}, D {D_test:5.3f} | Opt [A: {hits_opt/num_trajs:.2f}] | CCA [A: {hits_cca/num_trajs:.2f}] | Adapt [A: {hits_adapt/num_trajs:.2f}]")
-    print(f"Saved -> {filepath}")
-    plot_noise_sweep(filepath, plot_grid=False, log_x=True)
+                    # (Simplified row writing for brevity, include "Optimal" if you wish to track it in scaling plots)
+                    
+                    print(f" Dim {dim:2}, lam_u {lam_u:3}, D {D_test:5.3f} | Opt [A: {hits_opt/num_trajs:.2f}] | CCA [A: {hits_cca/num_trajs:.2f}]")
+
+    print(f"Data saved -> {dim_filepath}")
+
+    # Top panel: Scaling results (Success) | Bottom panel: Reference energy results
+    combined_plot_path = f"figures/combined_scaling_energy_{clean_mode_str}.pdf"
+    plot_combined_scaling_and_energy(
+        dim_csv_filepath=dim_filepath, 
+        energy_csv_filepath=energy_csv_reference, 
+        filepath=combined_plot_path
+    )
+    print(f"Combined plot saved -> {combined_plot_path}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 8. Baseline Comparisons & Ablations
@@ -1449,60 +1254,318 @@ def run_baseline_comparison(sys, a=0.5, r_neigh=np.inf, D_eval=0.01, dt=0.01,
                 print(f"    D={D_test:.4f} | {method_name:<22} | SR={sr:.3f} | E_s={me_s:.3f} | E_a={me_a:.3f}")
     print(f"  Saved -> {csv_filepath}")
 
-def plot_baseline_comparison(csv_filepath, sys_name, filepath,
-                            show_spread=True,
-                            ylim_sr=(-0.05, 1.05), ylim_energy=None,
-                            figsize=(6.5, 6.0),
-                            label_fontsize=11, legend_fontsize=7.5):
-    """Baseline comparison: color-by-metric, markers/linestyles encode method."""
+def plot_combined_scaling_and_energy(dim_csv_filepath, energy_csv_filepath,
+                                     filepath="figures/combined_scaling_energy.pdf",
+                                     include_adaptive=False,
+                                     success_ylim=(0.45, 1.05),
+                                     energy_ylim=None,
+                                     figsize=(6, 6.5),
+                                     label_fontsize=12, legend_fontsize=9):
+    """Two-panel plot: top = dimensionality scaling from dim CSV, bottom = energy from sweep CSV."""
     set_ieee_style()
-    data = _read_sweep_csv(csv_filepath, sys_name)
-    if not data: print(f"     [ERROR] No data in {csv_filepath}"); return
-
-    noises = sorted(set(d['Noise_D'] for d in data))
-    pseudo_zero, map_x, non_zero = _make_log_axis(noises)
-    methods_in_data = list(dict.fromkeys(d['Method'] for d in data))
-
-    fig, (ax_sr, ax_en) = plt.subplots(2, 1, figsize=figsize, sharex=True)
+    fig, (ax_scale, ax_energy) = plt.subplots(2, 1, figsize=figsize, sharex=True)
     fig.subplots_adjust(hspace=0.08)
-    legend_handles = []
-
-    for method in methods_in_data:
-        sty = _get_method_style(method)
-        xs, sr_vals, en_vals, sem_vals = [], [], [], []
-        for n in noises:
-            row = next((r for r in data if r['Noise_D'] == n and r['Method'] == method), None)
-            if not row: continue
-            ns = row.get('N_Success', 0)
-            sem = row['Std_Energy_Succ'] / np.sqrt(max(ns, 1)) if ns > 0 else 0.0
-            xs.append(map_x(n)); sr_vals.append(row['Success_Rate'])
-            en_vals.append(row['Mean_Energy_Succ']); sem_vals.append(sem)
-        if not xs: continue
-
-        ax_sr.plot(xs, sr_vals, marker=sty['marker'], color=C_SUCCESS, ls=sty['ls'],
-                   lw=sty['lw'], markersize=5)
-        en_a, sem_a = np.array(en_vals), np.array(sem_vals)
-        ax_en.plot(xs, en_a, marker=sty['marker'], color=C_ENERGY, ls=sty['ls'],
-                   lw=sty['lw'], markersize=5)
-        if show_spread and np.any(sem_a > 0):
-            ax_en.fill_between(xs, np.maximum(0, en_a - 1.96*sem_a), en_a + 1.96*sem_a, color=C_ENERGY, alpha=0.06)
-        legend_handles.append(Line2D([], [], color='#333', marker=sty['marker'], ls=sty['ls'],
-                                     lw=sty['lw'], markersize=5, label=sty['label']))
-
-    ax_sr.set_ylim(ylim_sr)
-    ax_sr.set_ylabel("Success rate", fontsize=label_fontsize, color=C_SUCCESS)
-    ax_sr.tick_params(axis='y', colors=C_SUCCESS)
-    ax_sr.legend(handles=legend_handles, loc='lower left', fontsize=legend_fontsize, ncol=2, framealpha=0.9)
-    if ylim_energy: ax_en.set_ylim(ylim_energy)
-    ax_en.set_ylabel("Mean control energy", fontsize=label_fontsize, color=C_ENERGY)
-    ax_en.tick_params(axis='y', colors=C_ENERGY)
-    ax_en.set_xscale('log'); ax_en.set_xticks([map_x(n) for n in noises])
-    ax_en.set_xticklabels(['0' if n == 0.0 else f"{n:.3g}" for n in noises], rotation=45, ha='right')
-    ax_en.set_xlabel("Noise strength ($D$)", fontsize=label_fontsize)
-    if non_zero:
-        for ax in (ax_sr, ax_en): ax.axvline(x=pseudo_zero*1.5, color='gray', ls=':', alpha=0.4, lw=0.6)
-    fig.align_ylabels([ax_sr, ax_en])
+ 
+    noises, non_zero = [], []
+    pseudo_zero = 0.0001
+    def map_x(n): return pseudo_zero if n == 0.0 else n
+ 
+    # --- Top panel: dimensionality scaling ---
+    if os.path.exists(dim_csv_filepath):
+        data_dim = []
+        with open(dim_csv_filepath, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row['Method'] != "CCA": continue
+                data_dim.append({
+                    'Dimension': int(row['Dimension']),
+                    'Lambda_u': float(row['Lambda_u']),
+                    'Noise_D': float(row['Noise_D']),
+                    'Value': float(row['Success_Rate']) + float(row.get('Timeout_Rate', 0.0))
+                })
+        if data_dim:
+            dims = sorted(set(d['Dimension'] for d in data_dim))
+            lams = sorted(set(d['Lambda_u'] for d in data_dim))
+            noises = sorted(set(d['Noise_D'] for d in data_dim))
+            non_zero = [n for n in noises if n > 0]
+            pseudo_zero = min(non_zero) / 2.0 if non_zero else 0.0001
+ 
+            palettes = {
+                lams[0]: [plt.cm.Purples(x) for x in np.linspace(0.85, 0.4, len(dims))],
+                lams[1]: [plt.cm.Oranges(x) for x in np.linspace(0.85, 0.4, len(dims))],
+            }
+            markers = ['o', 'D', 'X', '^', 's']
+            for lam in lams:
+                for j, dim in enumerate(dims):
+                    xs, ys = [], []
+                    for n in noises:
+                        row = next((r for r in data_dim if r['Dimension']==dim and r['Lambda_u']==lam and r['Noise_D']==n), None)
+                        if row: xs.append(map_x(n)); ys.append(row['Value'])
+                    if xs:
+                        ax_scale.plot(xs, ys, marker=markers[j%len(markers)], markersize=5,
+                                      color=palettes[lam][j], ls='-', lw=1.3, alpha=0.8)
+ 
+            ax_scale.set_ylim(success_ylim)
+            ax_scale.set_ylabel("Success rate", fontsize=label_fontsize)
+            if non_zero: ax_scale.axvline(x=pseudo_zero*1.5, color='gray', ls=':', alpha=0.4, lw=0.6)
+ 
+            leg = [Line2D([], [], color='none', label=r'$\lambda_u$')]
+            for lam in lams:
+                leg.append(Line2D([], [], color=palettes[lam][len(dims)//2], lw=2, label=f" {int(lam)}"))
+            leg.append(Line2D([], [], color='none', label='Dim.'))
+            for j, dim in enumerate(dims):
+                leg.append(Line2D([], [], color='gray', marker=markers[j%len(markers)], ls='-', lw=1.2, label=f" {dim}"))
+            ax_scale.legend(handles=leg, loc='lower left', fontsize=legend_fontsize, ncol=2, framealpha=0.9)
+ 
+    # --- Bottom panel: energy from sweep CSV ---
+    data_en = _read_sweep_csv(energy_csv_filepath)
+    if data_en:
+        methods_en = ["Optimal", "CCA"]
+        if not noises:
+            noises = sorted(set(d['Noise_D'] for d in data_en))
+            non_zero = [n for n in noises if n > 0]
+            pseudo_zero = min(non_zero) / 2.0 if non_zero else 0.0001
+        for method in methods_en:
+            sty = _get_method_style(method)
+            xs, ys, sems = [], [], []
+            for n in noises:
+                if method == "Optimal" and n == 0.0: continue
+                row = next((r for r in data_en if r['Noise_D']==n and r['Method']==method), None)
+                if row:
+                    ns = row.get('N_Success', 0)
+                    sem = row['Std_Energy_Succ'] / np.sqrt(max(ns, 1)) if ns > 0 else 0.0
+                    xs.append(map_x(n)); ys.append(row['Mean_Energy_Succ']); sems.append(sem)
+            if xs:
+                ys_a, sems_a = np.array(ys), np.array(sems)
+                ax_energy.plot(xs, ys_a, marker=sty['marker'], color=C_ENERGY, ls=sty['ls'],
+                               lw=sty['lw'], markersize=5, label=sty['label'])
+                if np.any(sems_a > 0):
+                    ax_energy.fill_between(xs, np.maximum(0, ys_a - 1.96*sems_a),
+                                           ys_a + 1.96*sems_a, color=C_ENERGY, alpha=0.08)
+        if energy_ylim: ax_energy.set_ylim(energy_ylim)
+        else:
+            all_en = [d['Mean_Energy_Succ'] for d in data_en if d['Method'] in methods_en and d['Mean_Energy_Succ'] > 0]
+            if all_en: ax_energy.set_ylim(min(all_en)*0.8, max(all_en)*1.25)
+        if non_zero: ax_energy.axvline(x=pseudo_zero*1.5, color='gray', ls=':', alpha=0.4, lw=0.6)
+        ax_energy.set_ylabel("Mean control energy", fontsize=label_fontsize, color=C_ENERGY)
+        ax_energy.tick_params(axis='y', colors=C_ENERGY)
+        ax_energy.legend(loc='upper left', fontsize=legend_fontsize)
+ 
+    ax_energy.set_xscale('log')
+    if noises:
+        ax_energy.set_xticks([map_x(n) for n in noises])
+        ax_energy.set_xticklabels(['0' if n==0 else f"{n:.3g}" for n in noises], rotation=45, ha='right')
+    ax_energy.set_xlabel("Noise strength ($D$)", fontsize=label_fontsize)
+    fig.align_ylabels([ax_scale, ax_energy])
     _save_fig(fig, filepath)
+
+def plot_baseline_comparison(
+    csv_filepath="figures/baselines.csv", 
+    filepath="figures/baseline_comparison.pdf", 
+    ylim_sr=(-0.05, 1.05), 
+    ylim_energy=None, 
+    yticks_sr="minmax",        
+    yticks_energy="minmax",    
+    orientation="horizontal",
+    figsize_ratio=None,
+    base_size=4.0,
+    min_D=None,
+    legend_loc="lower left",
+    legend_ax=1,               
+    font_size=10               
+):
+    """Plots Success Rate and Mean Control Energy for the baseline comparisons."""
+    if not os.path.exists(csv_filepath): 
+        print(f" [!] Data file {csv_filepath} not found.")
+        return
+        
+    data = []
+    with open(csv_filepath, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader: 
+            noise_val = float(row['Noise_D'])
+            if min_D is not None and noise_val < min_D:
+                continue
+            data.append({
+                'Method': row['Method'], 
+                'Noise_D': noise_val, 
+                'Success_Rate': float(row['Success_Rate']),
+                'Mean_Energy': float(row['Mean_Energy']),
+                'Std_Energy': float(row.get('Std_Energy', 0.0))
+            })
+            
+    plotted_methods = set(d['Method'] for d in data)
+            
+    noises = sorted(list(set(d['Noise_D'] for d in data)))
+    has_zero = 0.0 in noises
+    non_zero_noises = [n for n in noises if n > 0]
+    pseudo_zero = min(non_zero_noises) / 3.0 if non_zero_noises else 0.0001
+    def map_x(n): return pseudo_zero if n == 0.0 else n
+
+    if figsize_ratio is None:
+        figsize_ratio = (2.2, 1) if orientation == "horizontal" else (1, 1)
+    
+    width = base_size * figsize_ratio[0]
+    height = base_size * figsize_ratio[1]
+
+    if orientation == "horizontal":
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(width, height))
+        fig.subplots_adjust(wspace=0.25)
+    else:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(width, height), sharex=True)
+        fig.subplots_adjust(hspace=0.1)
+    
+    # --- 1. ENCODING: COLOR = ESTIMATOR ---
+    colors = {
+        "Oracle Committor": "#025230",          
+        "Oracle ReLU": "#025230",               
+        "Est CCA Committor": "#2c327b",         
+        "Est CCA ReLU": "#2c327b",              
+        "Est VAR Committor": "#8a2028",         
+        "Adaptive CCA Committor": "#d17c00"     
+    }
+    markers = {
+        "Oracle Committor": "D", "Oracle ReLU": "D", 
+        "Est CCA Committor": "o", "Est CCA ReLU": "o", 
+        "Est VAR Committor": "s", "Adaptive CCA Committor": "X"        
+    }
+    linestyles = {
+        "Oracle Committor": "-", "Oracle ReLU": "--", 
+        "Est CCA Committor": "-", "Est CCA ReLU": "--", 
+        "Est VAR Committor": "-", "Adaptive CCA Committor": "-"        
+    }
+    
+    for method in colors.keys():
+        if method not in plotted_methods:
+            continue
+            
+        xs_zero, ys_sr_zero, ys_en_zero, sem_en_zero = [], [], [], []
+        xs_pos, ys_sr_pos, ys_en_pos, sem_en_pos = [], [], [], []
+        
+        for n in noises:
+            row = next((r for r in data if r['Method'] == method and r['Noise_D'] == n), None)
+            if row:
+                sem = row['Std_Energy'] / np.sqrt(100)
+                if n == 0.0: 
+                    xs_zero.append(map_x(n))
+                    ys_sr_zero.append(row['Success_Rate'])
+                    ys_en_zero.append(row['Mean_Energy'])
+                    sem_en_zero.append(sem)
+                else: 
+                    xs_pos.append(map_x(n))
+                    ys_sr_pos.append(row['Success_Rate'])
+                    ys_en_pos.append(row['Mean_Energy'])
+                    sem_en_pos.append(sem)
+                    
+        col, mrk, ls = colors[method], markers[method], linestyles[method]
+        
+        is_oracle = "Oracle" in method
+        line_w = 3.0 if is_oracle else 1.5
+        m_size = 7 if is_oracle else 5
+        
+        if xs_zero: ax1.plot(xs_zero, ys_sr_zero, marker=mrk, color=col, ls='none', lw=line_w, markersize=m_size)
+        if xs_pos: ax1.plot(xs_pos, ys_sr_pos, marker=mrk, color=col, ls=ls, lw=line_w, markersize=m_size)
+        
+        if xs_zero: 
+            ax2.plot(xs_zero, ys_en_zero, marker=mrk, color=col, ls='none', lw=line_w, markersize=m_size)
+            if any(e > 0 for e in ys_en_zero):
+                lower_err = np.minimum(ys_en_zero, 1.96 * np.array(sem_en_zero)) 
+                ax2.errorbar(xs_zero, ys_en_zero, yerr=[lower_err, 1.96*np.array(sem_en_zero)], color=col, fmt='none', alpha=0.5)
+
+        if xs_pos: 
+            ax2.plot(xs_pos, ys_en_pos, marker=mrk, color=col, ls=ls, lw=line_w, markersize=m_size)
+            ys_en_pos_arr = np.array(ys_en_pos)
+            sem_en_pos_arr = np.array(sem_en_pos)
+            ci_lower = np.maximum(0, ys_en_pos_arr - 1.96 * sem_en_pos_arr)
+            ci_upper = ys_en_pos_arr + 1.96 * sem_en_pos_arr
+            ax2.fill_between(xs_pos, ci_lower, ci_upper, color=col, alpha=0.15 if not is_oracle else 0.05)
+        
+    # --- Formatting ---
+    if ylim_sr is not None: ax1.set_ylim(ylim_sr)
+    if ylim_energy is not None: ax2.set_ylim(ylim_energy)
+    else: ax2.set_ylim(bottom=min(-0.1, ax2.get_ylim()[0]))
+
+    # Helper function to strip .0 from integers
+    def fmt_tick(y):
+        return f"{int(y)}" if y == int(y) else f"{y}"
+
+    # Apply bulletproof Y-Ticks
+    if yticks_sr == "minmax": 
+        ticks = list(ax1.get_ylim())
+        ax1.set_yticks(ticks)
+        ax1.set_yticklabels([fmt_tick(y) for y in ticks])
+    elif yticks_sr is not None: 
+        ax1.set_yticks(yticks_sr)
+        ax1.set_yticklabels([fmt_tick(y) for y in yticks_sr])
+
+    if yticks_energy == "minmax": 
+        ticks = list(ax2.get_ylim())
+        ax2.set_yticks(ticks)
+        ax2.set_yticklabels([fmt_tick(y) for y in ticks])
+    elif yticks_energy is not None: 
+        ax2.set_yticks(yticks_energy)
+        ax2.set_yticklabels([fmt_tick(y) for y in yticks_energy])
+
+    ax1.set_ylabel("Success rate", fontsize=font_size)
+    ax2.set_ylabel("Control energy", fontsize=font_size)
+    
+    for ax in [ax1, ax2]:
+        ax.set_xscale('log')
+        ax.set_xticks([map_x(n) for n in noises])
+        
+        if orientation == "horizontal" or ax == ax2:
+            ax.set_xticklabels(['0' if n == 0.0 else f"{n:.3g}" for n in noises], rotation=45, ha='right', fontsize=font_size)
+            ax.set_xlabel("Noise strength ($D$)", fontsize=font_size)
+        elif orientation == "vertical" and ax == ax1:
+            plt.setp(ax.get_xticklabels(), visible=False)
+            
+        ax.tick_params(axis='y', labelsize=font_size)
+        ax.grid(True, linestyle='-', alpha=0.3, color='gray')
+        if has_zero and non_zero_noises: 
+            ax.axvline(x=pseudo_zero * 1.5, color='gray', linestyle=':', alpha=0.5)
+
+    # --- 2. STREAMLINED 2-GROUP LEGEND ---
+    custom_handles = []
+
+    custom_handles.append(Line2D([0], [0], color='none', label=r'$\mathbf{Estimator}$'))
+    if any("Oracle" in m for m in plotted_methods):
+        custom_handles.append(Line2D([0], [0], color='#025230', lw=2, marker='D', markersize=6, label='Oracle'))
+    if any("CCA" in m for m in plotted_methods):
+        custom_handles.append(Line2D([0], [0], color='#2c327b', lw=2, marker='o', markersize=6, label='CCA Estimator'))
+    if any("VAR" in m for m in plotted_methods):
+        custom_handles.append(Line2D([0], [0], color='#8a2028', lw=2, marker='s', markersize=6, label='VAR Estimator'))
+    if any("Adaptive" in m for m in plotted_methods):
+        custom_handles.append(Line2D([0], [0], color='#d17c00', lw=2, marker='X', markersize=6, label='Adaptive CCA'))
+
+    custom_handles.append(Line2D([0], [0], color='none', label=' ')) 
+    
+    custom_handles.append(Line2D([0], [0], color='none', label=r'$\mathbf{Controller}$'))
+    if any("Committor" in m for m in plotted_methods):
+        custom_handles.append(Line2D([0], [0], color='gray', lw=1.5, ls='-', label='Committor'))
+    if any("ReLU" in m for m in plotted_methods):
+        custom_handles.append(Line2D([0], [0], color='gray', lw=1.5, ls='--', label='ReLU'))
+
+    target_ax = ax1 if legend_ax == 1 else ax2
+    target_ax.legend(
+        handles=custom_handles,
+        loc=legend_loc, 
+        fontsize=font_size * 0.9, 
+        labelspacing=0.2,       
+        handlelength=1.5,       
+        handletextpad=0.5,      
+        borderaxespad=0.5,      
+        framealpha=0.9
+    )
+    
+    if orientation == "vertical":
+        fig.align_ylabels([ax1, ax2])
+    
+    fig.tight_layout()
+    fig.savefig(filepath, bbox_inches="tight")
+    fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight")
+    print(f" Saved Grouped Baseline Plot (legend_ax={legend_ax}) -> {filepath}")
+    plt.close(fig)
+
 
 def run_trust_region_ablation(sys, a=0.5, D_eval=0.01, dt=0.01, num_trajs=500, T_sim=2000,
                                T_train=2500, tau=10, r_neigh_values=None,
@@ -1538,6 +1601,79 @@ def run_trust_region_ablation(sys, a=0.5, D_eval=0.01, dt=0.01, num_trajs=500, T
             writer.writerow([sys.name, rn_str, cos_sim, p['lambda_u'], p['D'], sr, me, se, len(energies)])
             print(f"    r_neigh={rn_str:>6} | cos={cos_sim:.4f} | lam={p['lambda_u']:.3f} | D={p['D']:.5f} | SR={sr:.3f} | E={me:.3f}")
     print(f"  Saved -> {csv_filepath}")
+
+def run_neighborhood_ablation(sys, a_eval, a_train_levels, dt, tau, D_train, D_test, 
+                              num_eval_trajs, csv_filepath):
+    """
+    Evaluates how the training neighborhood size (a) affects estimator 
+    accuracy and control performance.
+    """
+    fieldnames = ["Config", "dLambda", "dW_angle", "dD", "Success", "Energy"]
+    
+    with open(csv_filepath, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for a_train in a_train_levels:
+            # 1. Train the Estimator (Algorithm 1)
+            # Use a_train to set the "limit" or "r_neigh" in the training phase
+            tracker = CCATracker(dim=sys.dim, dt=dt, tau=tau, use_whitened=True)
+            
+            # The 'train' method uses the neighborhood size to gate data 
+            tracker.train(
+                sys.drift, T=5000, dt=dt, D=D_train, seed=42, 
+                a=a_eval, sign_ref=sys.w_u_true, 
+                init_center=sys.x_star, r_neigh=a_train
+            )
+            
+            params = tracker.get_params(sys.w_u_true)
+            
+            # 2. Compute Estimation Errors 
+            d_lambda = abs(params['lambda_u'] - sys.lambda_u_true)
+            
+            # Angular error in degrees 
+            cos_sim = np.clip(np.dot(params['w_u'], sys.w_u_true), -1.0, 1.0)
+            dw_angle = np.degrees(np.arccos(cos_sim))
+            
+            d_D = abs(params['D'] - D_test)
+
+            # 3. Evaluate Control Performance 
+            # Sample initial conditions near the saddle [cite: 243]
+            rng = np.random.default_rng(123)
+            success_count = 0
+            total_energy = 0.0
+            
+            for _ in range(num_eval_trajs):
+                # Standard IC sampling from the manuscript [cite: 243]
+                x0 = sys.x_star + rng.uniform(0, 0.75*a_eval) * sys.w_u_true
+                
+                # simulate_trajectory should return (path, hit_status, energy)
+                _, status, energy = simulate_trajectory(
+                    x0, T_sim=2000, dt=dt, drift_func=sys.drift, 
+                    D=D_test, controller=tracker, sys=sys, a=a_eval, rng=rng
+                )
+                
+                if status == "reached_A": # Success 
+                    success_count += 1
+                    total_energy += energy
+
+            success_rate = success_count / num_eval_trajs
+            avg_energy = total_energy / success_count if success_count > 0 else 0.0
+
+            # 4. Save results 
+            config_label = f"a={a_train}" if a_train != np.inf else "Ungated"
+            row = {
+                "Config": config_label,
+                "dLambda": f"{d_lambda:.2f}",
+                "dW_angle": f"{dw_angle:.1f}°",
+                "dD": f"{d_D:.4f}",
+                "Success": f"{success_rate:.2f}",
+                "Energy": f"{avg_energy:.2f}"
+            }
+            writer.writerow(row)
+            print(f"Finished {config_label}: Success={success_rate:.2f}, Angle Err={dw_angle:.1f}°")
+
+    print(f"Ablation results saved to {csv_filepath}")
 
 def run_hyperparameter_ablation(sys, a=0.5, r_neigh=np.inf, D_eval=0.01, dt=0.01,
                                  num_trajs=500, T_sim=2000, T_train=2500,
@@ -1654,125 +1790,3 @@ def plot_hyperparameter_ablation(csv_filepath, sys_name, filepath, true_lambda=2
     fig.savefig(filepath, bbox_inches="tight"); fig.savefig(filepath.replace('.pdf', '.png'), bbox_inches="tight")
     print(f"     Saved hyperparam ablation -> {filepath}"); plt.close(fig)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# MAIN EXECUTION SCRIPT
-# ──────────────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    dt = 0.01
-    num_trajs = 1000
-
-    sys_dw   = make_double_well_curved(lambda_u=2.0, lambda_s=8.0, c=0.5)
-    sys_lin  = make_linear_system(lambda_u=2.0, lambda_s=-8.0)
-    sys_pend = make_pendulum(g=1.5, length=1.0, damping=0.0)
-
-    use_whitened = True
-
-    systems = {
-        "linear_2d":   (sys_lin,  1.0, np.inf, 10, 0.01),
-        "double_well": (sys_dw,   0.5, 0.5,    10, 0.01),
-        "pendulum":    (sys_pend, 1.0, 1.0,    30, 0.01),
-    }
-
-    # ══════════════════════════════════════════════════════════════════════
-    # FIGURE 1: Single trajectory examples (all 3 systems)
-    #   Autonomous / Data-enabled (open-loop) / Closed-loop (adaptive)
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n" + "#"*80 + "\n FIGURE 1: Trajectory examples\n" + "#"*80)
-    traj_methods = ["Autonomous", "CCA (Whitened)", "CCA (Adaptive)"]
-    for tag, (sys, a, r_neigh, tau, D_eval) in systems.items():
-        run_evaluation_suite(sys, a=a, r_neigh=r_neigh, D_eval=D_eval, dt=dt,
-                             num_trajs=100, plot_trajs=3, spread_s=0.75, tau=tau,
-                             methods_to_run=traj_methods, use_whitened=use_whitened,
-                             file_suffix="trajs")
-
-    # ══════════════════════════════════════════════════════════════════════
-    # FIGURE 2: Linear system diagnostics
-    #   2a. Parameter convergence
-    #   2b. Noise sweep (success + energy vs D)
-    #   2c. Dimensionality & lambda scaling
-    #   2d. Combined scaling + energy
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n" + "#"*80 + "\n FIGURE 2: Linear diagnostics\n" + "#"*80)
-    sys, a, r_neigh, tau, D_eval = systems["linear_2d"]
-
-    # 2a. Convergence
-    conv_csv = "figures/linear_2d_convergence.csv"
-    generate_convergence_data(sys, a=a, D_train=D_eval, dt=dt, T_train=500,
-                              r_neigh=r_neigh, num_trajs=num_trajs, tau=tau,
-                              use_whitened=use_whitened, csv_filepath=conv_csv)
-    plot_convergence_from_data(csv_filepath=conv_csv, sys_lambda_true=sys.lambda_u_true,
-                               sys_D_true=D_eval, filepath="figures/linear_2d_convergence.pdf",
-                               layout="stacked", label_fontsize=13, tick_fontsize=12, legend_fontsize=10)
-
-    # 2b. Noise sweep (D)
-    energy_csv = "figures/linear_2d_noise_sweep.csv"
-    simulate_and_save_noise_energy_sweep(sys, a=a, dt=dt, r_neigh=r_neigh,
-                                         num_trajs=num_trajs, T_sim=2000, tau=tau,
-                                         use_whitened=use_whitened, csv_filepath=energy_csv)
-    plot_success_and_energy_vs_noise(csv_filepath=energy_csv, sys_name=sys.name,
-                                     filepath="figures/linear_2d_noise_sweep.pdf",
-                                     layout="stacked", include_adaptive=False)
-
-    # 2c. Dimensionality & lambda scaling
-    run_dimensionality_scaling_experiment(dt=dt, num_trajs=num_trajs, T_sim=5000, use_whitened=use_whitened)
-
-    # 2d. Combined scaling + energy
-    plot_scaling_and_energy(dim_csv_filepath="figures/dimensionality_scaling_stats.csv",
-                            energy_csv_filepath=energy_csv,
-                            include_adaptive=False, line_alpha=0.7,
-                            filepath="figures/linear_2d_combined_scaling_energy.pdf")
-
-    # ══════════════════════════════════════════════════════════════════════
-    # FIGURE 3: Nonlinear systems — noise sweep (D) only
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n" + "#"*80 + "\n FIGURE 3: Nonlinear noise sweeps\n" + "#"*80)
-    for tag in ["double_well", "pendulum"]:
-        sys, a, r_neigh, tau, D_eval = systems[tag]
-        csv_path = f"figures/{tag}_noise_sweep.csv"
-        simulate_and_save_noise_energy_sweep(sys, a=a, dt=dt, r_neigh=r_neigh,
-                                              num_trajs=num_trajs, T_sim=2000, tau=tau,
-                                              use_whitened=use_whitened, csv_filepath=csv_path)
-        plot_success_and_energy_vs_noise(csv_filepath=csv_path, sys_name=sys.name,
-                                          filepath=f"figures/{tag}_noise_sweep.pdf",
-                                          layout="stacked", include_adaptive=False)
-
-    # ══════════════════════════════════════════════════════════════════════
-    # FIGURE 4: Baseline comparisons (linear + double well)
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n" + "#"*80 + "\n FIGURE 4: Baseline comparisons\n" + "#"*80)
-    for tag in ["linear_2d", "double_well"]:
-        sys, a, r_neigh, tau, D_eval = systems[tag]
-        csv_path = f"figures/{tag}_baselines.csv"
-        run_baseline_comparison(sys, a=a, r_neigh=r_neigh, D_eval=D_eval, dt=dt,
-                                num_trajs=500, T_sim=2000, T_train=2500, tau=tau,
-                                csv_filepath=csv_path)
-        plot_baseline_comparison(csv_path, sys.name, f"figures/{tag}_baselines.pdf")
-
-    # ══════════════════════════════════════════════════════════════════════
-    # FIGURE 5: Ablations
-    #   5a. Trust-region radius (double well + pendulum)
-    #   5b. Hyperparameters tau, gamma (linear)
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n" + "#"*80 + "\n FIGURE 5: Ablations\n" + "#"*80)
-
-    # 5a. Trust-region ablation on nonlinear systems
-    for tag in ["double_well", "pendulum"]:
-        sys, a, r_neigh, tau, D_eval = systems[tag]
-        csv_path = f"figures/{tag}_trust_ablation.csv"
-        run_trust_region_ablation(sys, a=a, D_eval=D_eval, dt=dt, num_trajs=500,
-                                  T_sim=2000, T_train=2500, tau=tau,
-                                  r_neigh_values=[0.25, 0.5, 1.0, 2.0, np.inf],
-                                  csv_filepath=csv_path)
-        plot_trust_region_ablation(csv_path, sys.name, f"figures/{tag}_trust_ablation.pdf")
-
-    # 5b. Hyperparameter ablation on linear system
-    sys, a, r_neigh, tau, D_eval = systems["linear_2d"]
-    csv_path = "figures/linear_2d_hyperparam_ablation.csv"
-    run_hyperparameter_ablation(sys, a=a, r_neigh=r_neigh, D_eval=D_eval, dt=dt,
-                                 num_trajs=500, T_sim=2000, T_train=2500,
-                                 tau_values=[1, 5, 10, 20, 50],
-                                 gamma_values=[0.001, 0.005, 0.01, 0.05, 0.1],
-                                 csv_filepath=csv_path)
-    plot_hyperparameter_ablation(csv_path, sys.name, "figures/linear_2d_hyperparam_ablation.pdf",
-                                 true_lambda=sys.lambda_u_true)
