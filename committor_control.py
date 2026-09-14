@@ -833,7 +833,7 @@ def simulate_and_save_noise_energy_sweep(sys, a=0.5, dt=0.01, r_neigh=np.inf, nu
                     if use_tr: _, hit, en = simulate_adaptive_trajectory(x0, T_sim, dt, sys.drift, D_test, copy.deepcopy(trk), sys, a, r_neigh, None, run_rng, is_adaptive=is_adp)
                     else: _, hit, en = simulate_trajectory(x0, T_sim, dt, sys.drift, D_test, ctrl, sys, a, run_rng)
                     e_all.append(en)
-                    if hit == "reached_A": e_succ.append(en)
+                    if hit == "reached_A" or (D_test < 1e-8 and hit == "timeout"): e_succ.append(en)
                 
                 writer.writerow([sys.name, method_name, D_test, len(e_succ)/num_trajs, num_trajs, np.mean(e_succ) if e_succ else 0, np.std(e_succ) if e_succ else 0, len(e_succ), np.mean(e_all), np.std(e_all), len(e_all)])
 
@@ -982,6 +982,131 @@ def plot_scaling_and_energy(csv_filepath, sys_name=None, filepath="figures/scali
                  
     if is_stacked: fig.align_ylabels([ax_sr, ax_en])
     _save_fig(fig, filepath)
+
+def plot_noise_sweep_panel(csv_filepath, filepath, sys_name=None, ylim_success=(0.9, 1.0), ylim_energy=(0.0, 1.5),
+                           figsize=(6.4, 3.0), xtick_values=(0.0, 0.001, 0.01, 0.1), legend_kwargs=None):
+    """Success rate (left axis) and mean control energy of successful trajectories (right axis) vs noise D.
+
+    Panel C of the double-well and pendulum figures. D = 0 is drawn as isolated markers left of a dotted line.
+    Energy bands are 95% confidence intervals of the mean, using the actual number of successful trajectories.
+    legend_kwargs are passed to the legend (default: one row above the axes). Returns the list of overlaps found
+    between text labels, the legend and the plotted data (empty if none).
+    """
+    import matplotlib.font_manager as fm
+    for f in fm.findSystemFonts(fontpaths=[os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Windows\Fonts")]):
+        try: fm.fontManager.addfont(f)
+        except Exception: pass
+    if not fm.findfont(fm.FontProperties(family="CMU Serif")).lower().endswith("cmunrm.ttf"):
+        print("  [!] CMU Serif not found; falling back to the default serif font")
+    style = {"font.family": "serif", "font.serif": ["CMU Serif", "DejaVu Serif"], "mathtext.fontset": "cm",
+             "font.size": 16, "axes.labelsize": 18, "xtick.labelsize": 15, "ytick.labelsize": 15,
+             "legend.fontsize": 15, "axes.linewidth": 1.2, "lines.linewidth": 2.2, "legend.frameon": False,
+             "pdf.fonttype": 42, "ps.fonttype": 42}
+    c_success, c_energy = "#0072B2", "#D55E00"  # Okabe-Ito blue and vermillion
+    methods = [("Optimal", "Model-based", "-", "o"), ("CCA", "Data-enabled", "--", "s")]
+    data = _read_sweep_csv(csv_filepath, sys_name)
+    noises = sorted({d['Noise_D'] for d in data})
+    pseudo_zero, map_x, non_zero = _make_log_axis(noises)
+
+    with plt.rc_context(style):
+        fig, ax_sr = plt.subplots(figsize=figsize)
+        ax_en = ax_sr.twinx()
+        for i, (method, _, ls, marker) in enumerate(methods):
+            rows = {d['Noise_D']: d for d in data if d['Method'] == method}
+            if 0.0 in rows:
+                r0, x0 = rows[0.0], map_x(0.0) * (0.8, 1.25)[i]  # side by side, so equal values stay visible
+                ax_sr.plot(x0, r0['Success_Rate'], marker=marker, color=c_success, ls='none', ms=8)
+                if r0['N_Success'] > 0:
+                    ax_en.plot(x0, r0['Mean_Energy_Succ'], marker=marker, color=c_energy, ls='none', ms=8)
+            xs = [n for n in non_zero if n in rows]
+            ax_sr.plot(xs, [rows[n]['Success_Rate'] for n in xs], color=c_success, ls=ls, marker=marker, ms=6)
+            xe = [n for n in xs if rows[n]['N_Success'] > 0]
+            en = np.array([rows[n]['Mean_Energy_Succ'] for n in xe])
+            half = np.array([1.96 * rows[n]['Std_Energy_Succ'] / np.sqrt(rows[n]['N_Success']) for n in xe])
+            ax_en.plot(xe, en, color=c_energy, ls=ls, marker=marker, ms=6)
+            ax_en.fill_between(xe, np.maximum(0.0, en - half), en + half, color=c_energy, alpha=0.15, lw=0)
+
+        from matplotlib import ticker as mticker
+        ax_sr.set_xscale('log')
+        ticks = [n for n in xtick_values if n in noises]
+        ax_sr.set_xticks([map_x(n) for n in ticks])
+        ax_sr.set_xticklabels(['0' if n == 0.0 else f"{n:g}" for n in ticks])
+        ax_sr.xaxis.set_minor_locator(mticker.FixedLocator([map_x(n) for n in noises if n not in ticks]))
+        ax_sr.xaxis.set_minor_formatter(mticker.NullFormatter())
+        ax_sr.axvline(pseudo_zero * 1.8, color='gray', ls=':', lw=1.0, alpha=0.6)
+        ax_sr.set_xlabel(r"Noise strength $D$")
+        for ax, lim, color, label in ((ax_sr, ylim_success, c_success, "Success rate"),
+                                      (ax_en, ylim_energy, c_energy, "Control energy")):
+            ax.set_ylim(lim[0], lim[1] + 0.03 * (lim[1] - lim[0]))  # headroom so markers at the top value are not clipped
+            ax.set_yticks(list(lim))
+            ax.set_yticklabels([f"{t:g}" for t in lim])
+            ax.set_ylabel(label, color=color)
+            ax.tick_params(axis='y', colors=color)
+            ax.spines['top'].set_visible(False)
+        ax_sr.spines['right'].set_visible(False)
+        ax_en.spines['left'].set_visible(False)
+        handles = [mlines.Line2D([], [], color='#333333', ls=ls, marker=marker, ms=6, label=label)
+                   for _, label, ls, marker in methods]
+        kw = dict(loc='lower center', ncol=2, bbox_to_anchor=(0.5, 1.0), borderaxespad=0.2)
+        kw.update(legend_kwargs or {})
+        ax_en.legend(handles=handles, **kw)
+        overlaps = _find_panel_overlaps(fig)
+        for o in overlaps:
+            print(f"  [!] overlap: {o}")
+        d = os.path.dirname(filepath)
+        if d: os.makedirs(d, exist_ok=True)
+        fig.savefig(filepath, bbox_inches="tight")
+        fig.savefig(os.path.splitext(filepath)[0] + ".png", dpi=300, bbox_inches="tight")
+        plt.close(fig)
+    print(f"  Saved -> {filepath}")
+    return overlaps
+
+
+def _find_panel_overlaps(fig, pad_pt=2.0):
+    """Overlaps (display coordinates) between text labels and the legend, and between the legend and plotted data."""
+    from matplotlib.path import Path
+    from matplotlib.transforms import Bbox
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    px = fig.dpi / 72.0
+    pad = pad_pt * px
+    boxes = []
+    for ax in fig.axes:
+        labels = (ax.get_xticklabels() if ax.xaxis.get_visible() else []) + ax.get_yticklabels()
+        for t in labels:
+            if t.get_visible() and t.get_text():
+                boxes.append((f"tick label '{t.get_text()}'", t.get_window_extent(renderer)))
+        for axis in (ax.xaxis, ax.yaxis):
+            if axis.get_visible() and axis.label.get_visible() and axis.label.get_text():
+                boxes.append((f"axis label '{axis.label.get_text()}'", axis.label.get_window_extent(renderer)))
+    legends = [ax.get_legend() for ax in fig.axes if ax.get_legend() is not None] + list(fig.legends)
+    boxes += [("legend", leg.get_window_extent(renderer)) for leg in legends]
+    found = []
+    for i, (name_a, a) in enumerate(boxes):
+        for name_b, b in boxes[i + 1:]:
+            if a.x0 < b.x1 + pad and b.x0 < a.x1 + pad and a.y0 < b.y1 + pad and b.y0 < a.y1 + pad:
+                found.append(f"{name_a} / {name_b}")
+    for leg in legends:
+        lb = leg.get_window_extent(renderer)
+        for ax in fig.axes:
+            for line in ax.get_lines():
+                xy = line.get_xydata()
+                if len(xy) == 0:
+                    continue
+                verts = line.get_transform().transform(xy)
+                has_marker = line.get_marker() not in (None, 'None', '', ' ')
+                has_line = line.get_linestyle() not in (None, 'None', '', ' ')
+                grow = max(line.get_markersize() / 2 if has_marker else 0.0, line.get_linewidth() / 2) * px + pad
+                bb = Bbox.from_extents(lb.x0 - grow, lb.y0 - grow, lb.x1 + grow, lb.y1 + grow)
+                if (has_line and len(verts) > 1 and Path(verts).intersects_bbox(bb, filled=False)) or \
+                        (has_marker and any(bb.contains(x, y) for x, y in verts)):
+                    found.append("legend / plotted line or marker")
+            for coll in ax.collections:
+                for p in coll.get_paths():
+                    bb = Bbox.from_extents(lb.x0 - pad, lb.y0 - pad, lb.x1 + pad, lb.y1 + pad)
+                    if Path(coll.get_transform().transform(p.vertices)).intersects_bbox(bb, filled=True):
+                        found.append("legend / shaded band")
+    return sorted(set(found))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 6e. Control comparison
