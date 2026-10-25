@@ -26,6 +26,8 @@ This project requires Python 3.8+ and standard scientific computing libraries.
 ```bash
 pip install -r requirements.txt
 python committor_control.py
+```
+
 
 ## Publication
 
@@ -46,3 +48,4 @@ If you use this code, please cite:
   note      = {To appear}
 }
 ```
+
