@@ -26,3 +26,23 @@ This project requires Python 3.8+ and standard scientific computing libraries.
 ```bash
 pip install -r requirements.txt
 python committor_control.py
+
+## Publication
+
+This repository contains the code for the paper
+
+> **Data-Enabled Local Reach-Avoid Control Near Saddle Equilibria with a Neuronal Interpretation**
+> Ábel Ságodi, Joshua L. Pughe-Sanford, Xuehao Ding and Dmitri B. Chklovskii
+> *65th IEEE Conference on Decision and Control (CDC)*, Honolulu, HI, USA, December 2026 (to appear).
+
+If you use this code, please cite:
+
+```bibtex
+@inproceedings{sagodi2026reachavoid,
+  title     = {Data-Enabled Local Reach-Avoid Control Near Saddle Equilibria with a Neuronal Interpretation},
+  author    = {S\'{a}godi, \'{A}bel and Pughe-Sanford, Joshua L. and Ding, Xuehao and Chklovskii, Dmitri B.},
+  booktitle = {65th IEEE Conference on Decision and Control (CDC)},
+  year      = {2026},
+  note      = {To appear}
+}
+```
